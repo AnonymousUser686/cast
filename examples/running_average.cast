@@ -6,6 +6,7 @@
 machine RunningAverage {
     interface {
         input uint16 value;
+        input uint16 test;
     }
     shared {
         var uint32 total;

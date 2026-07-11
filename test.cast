@@ -1,0 +1,41 @@
+// Beginner: generates the Fibonacci sequence indefinitely.
+// Shows how two shared registers can implement a recurrence relation.
+// The hardware trick: all register reads return the pre-update value, so
+//   new_b = a + b  and  new_a = b  evaluate using the same-cycle values.
+
+machine Array_sum {
+    interface {}
+    shared {
+        var uint32 a[10];
+        var uint32 b[10];
+	var uint32 c[10];
+	var uint8  i;
+	var uint8  k;	
+    }
+    states {
+        init: {  /* start state */
+	    for (i = 0; i< 10; i++) {
+	      a[i] = i;       /* show dependenies */
+	      b[i] = a[i]+1;
+	      c[i] = 0;
+	      k = 10; 
+	    }
+	    print("Done init");
+            goto sum;
+        }
+        sum: {
+           for (i = 0; i< k; i++) { /* in theory can unroll this loop */ 
+	     c[i] = a[i] + b[i];
+	   }
+	   print("Finished Sum");	   
+	   goto done;
+        }
+       done: {
+	print("Finished program c[9] is: ", c[9]);
+      }
+    } /* end states*/ 
+} /* end machine Array_sum */
+
+instantiate {
+    f = Array_sum();
+}

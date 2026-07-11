@@ -1,12 +1,10 @@
 #include "castLower.hpp"
 #include <iostream>
-#include "castLexer.h"
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Location.h>
 #include <mlir/IR/OwningOpRef.h>
 #include "mlir/IR/MLIRContext.h"
-
 #include <circt/Dialect/HW/HWTypes.h>
 #include <circt/Dialect/HW/HWOps.h>
 #include <circt/Dialect/ESI/ESIOps.h>
@@ -36,12 +34,91 @@ using namespace std;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AST Dispatcher
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::any LowerVisitor::visit(ast::ASTNode *node)
+{
+    if (!node) return std::any();
+    switch (node->getKind())
+    {
+    case ast::ASTNodeKind::Program:
+        for (auto &decl : static_cast<ast::Program*>(node)->decls)
+        {
+            visit(decl.get());
+        }
+        return std::any();
+    case ast::ASTNodeKind::EnumDecl:
+        return visitDecl_enum(*static_cast<ast::EnumDecl*>(node));
+    case ast::ASTNodeKind::MachineDecl:
+        return visitDecl_machine(*static_cast<ast::MachineDecl*>(node));
+    case ast::ASTNodeKind::InterfaceBlock:
+        return visitDecl_interface(*static_cast<ast::InterfaceBlock*>(node));
+    case ast::ASTNodeKind::SharedBlock:
+        return visitDecl_shared(*static_cast<ast::SharedBlock*>(node));
+    case ast::ASTNodeKind::StatesBlock:
+        return visitDecl_states(*static_cast<ast::StatesBlock*>(node));
+    case ast::ASTNodeKind::StateDecl:
+        return visitDecl_state(*static_cast<ast::StateDecl*>(node));
+    case ast::ASTNodeKind::InstantiateDecl:
+        return visitDecl_instantiate(*static_cast<ast::InstantiateDecl*>(node));
+    case ast::ASTNodeKind::VarDecl:
+        return visitDecl_var(*static_cast<ast::VarDecl*>(node));
+    
+    // Statements
+    case ast::ASTNodeKind::BlockStmt:
+        return visitBlockStmt(*static_cast<ast::BlockStmt*>(node));
+    case ast::ASTNodeKind::VarDeclStmt:
+        return visitDecl_var(*static_cast<ast::VarDeclStmt*>(node)->varDecl);
+    case ast::ASTNodeKind::InstModuleStmt:
+        return visitInst_module(*static_cast<ast::InstModuleStmt*>(node));
+    case ast::ASTNodeKind::IfStmt:
+        return visitStmt_if(*static_cast<ast::IfStmt*>(node));
+    case ast::ASTNodeKind::BinaryStmt:
+        return visitStmt_binary(*static_cast<ast::BinaryStmt*>(node));
+    case ast::ASTNodeKind::GotoStmt:
+        return visitStmt_nextstate(*static_cast<ast::GotoStmt*>(node));
+    case ast::ASTNodeKind::ExprStmt:
+        return visit(static_cast<ast::ExprStmt*>(node)->expr.get());
+    case ast::ASTNodeKind::ForStmt:
+        return visitForStmt(*static_cast<ast::ForStmt*>(node));
+    case ast::ASTNodeKind::SwitchStmt:
+        return visitSwitchStmt(*static_cast<ast::SwitchStmt*>(node));
+    case ast::ASTNodeKind::ReturnStmt:
+        return visitReturnStmt(*static_cast<ast::ReturnStmt*>(node));
+
+    // Expressions
+    case ast::ASTNodeKind::IdentExpr:
+        return visitIdent(*static_cast<ast::IdentExpr*>(node));
+    case ast::ASTNodeKind::FieldExpr:
+        return visitIdent_field(*static_cast<ast::FieldExpr*>(node));
+    case ast::ASTNodeKind::NumberLiteral:
+        return visitNumber_literal(*static_cast<ast::NumberLiteral*>(node));
+    case ast::ASTNodeKind::StringLiteral:
+        notImplemented("string literals in expressions");
+    case ast::ASTNodeKind::NilLiteral:
+        notImplemented("nil literals");
+    case ast::ASTNodeKind::UnaryExpr:
+    case ast::ASTNodeKind::BinaryExpr:
+    case ast::ASTNodeKind::UpdateExpr:
+        return visitExpr(*static_cast<ast::Expr*>(node));
+    case ast::ASTNodeKind::CallExpr:
+        return visitExpr_func_call(*static_cast<ast::CallExpr*>(node));
+    
+    default:
+        return std::any();
+    }
+}
+
+std::any LowerVisitor::visit(const std::shared_ptr<ast::ASTNode> &node)
+{
+    return visit(node.get());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Extend or truncate `v` to match `t`. If types already agree, returns v.
-// Comb ops require signless integers, so signed/unsigned MLIR IntegerTypes
-// are first cast to signless of the same width via UnrealizedConversionCastOp.
 mlir::Value LowerVisitor::coerce(mlir::Value v, mlir::Type t, mlir::Location loc)
 {
     if (!v || !t) return v;
@@ -49,7 +126,6 @@ mlir::Value LowerVisitor::coerce(mlir::Value v, mlir::Type t, mlir::Location loc
     auto dstInt = mlir::dyn_cast<mlir::IntegerType>(t);
     if (!srcInt || !dstInt) return v;
 
-    // Drop signedness on the source so comb ops accept it.
     if (!srcInt.isSignless())
     {
         mlir::Type signless = mlir::IntegerType::get(&this->ctx, srcInt.getWidth());
@@ -72,7 +148,6 @@ mlir::Value LowerVisitor::coerce(mlir::Value v, mlir::Type t, mlir::Location loc
     return circt::comb::ExtractOp::create(builder, loc, targetSignless, v, 0);
 }
 
-// Read the live value of a shared variable (the register's current output).
 mlir::Value LowerVisitor::readVar(const std::string &name)
 {
     auto &mvars = this->varRegs[this->currentModuleName];
@@ -81,9 +156,6 @@ mlir::Value LowerVisitor::readVar(const std::string &name)
     return it->second.getResult();
 }
 
-// Append a conditional update to the variable's next-value chain.
-//   varNext = mux(cond, newVal, varNext_prev)
-// At module finalize, varNext is wired into the register input as operand 0.
 void LowerVisitor::writeVar(const std::string &name, mlir::Value newVal, mlir::Value cond)
 {
     auto &mvars = this->varRegs[this->currentModuleName];
@@ -100,30 +172,25 @@ void LowerVisitor::writeVar(const std::string &name, mlir::Value newVal, mlir::V
 // Top-level declarations
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::any LowerVisitor::visitDecl_enum(castParser::Decl_enumContext *antlrCtx)
+std::any LowerVisitor::visitDecl_enum(ast::EnumDecl &decl)
 {
-    // enum Name = { A, B, C };  →  fold each member into an i8 encoding table.
-    auto idents = antlrCtx->ident();
-    if (idents.size() < 2) return std::any();
-    // First ident is the enum name; the rest are members (numbered 0..N-1).
     unsigned width = 8;
-    for (size_t i = 1; i < idents.size(); ++i)
+    for (size_t i = 0; i < decl.members.size(); ++i)
     {
-        std::string name = idents[i]->getText();
-        this->enumValues[name] = {static_cast<uint64_t>(i - 1), width};
+        std::string name = decl.members[i];
+        this->enumValues[name] = {static_cast<uint64_t>(i), width};
     }
     return std::any();
 }
 
-std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrCtx)
+std::any LowerVisitor::visitDecl_machine(ast::MachineDecl &decl)
 {
     mlir::OpBuilder &b = this->builder;
     mlir::Location loc = b.getUnknownLoc();
     b.setInsertionPointToStart(this->topModule.getBody());
 
-    // ── Pass 1: collect interface ports only, so we can declare the module ───
     this->currentPorts.clear();
-    std::string moduleName = antlrCtx->func_name()->getText();
+    std::string moduleName = decl.name;
     this->currentModuleName = moduleName;
     this->variables[moduleName];
     this->portValues[moduleName];
@@ -135,12 +202,9 @@ std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrC
     this->outputDataNext[moduleName];
     this->outputValidNext[moduleName];
 
-    // Walk only the interface block on this pass.
-    if (auto blk = antlrCtx->machine_block())
-        if (auto iface = blk->decl_interface())
-            visit(iface);
+    if (decl.interfaceBlock)
+        visit(decl.interfaceBlock);
 
-    // Add implicit clk + rst ports (inserted at the front, in order rst, clk).
     circt::hw::PortInfo rstPort;
     rstPort.name = b.getStringAttr("rst");
     rstPort.type = b.getI1Type();
@@ -162,8 +226,6 @@ std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrC
     for (auto &op : llvm::make_early_inc_range(body->getOperations()))
         if (mlir::isa<circt::hw::OutputOp>(op)) op.erase();
 
-    // Block arguments hold ONLY input ports (output ports come back via hw.output).
-    // Order is: clk(0), rst(1), then user-declared input channels.
     this->currentClock = body->getArgument(0);
     unsigned argIdx = 0;
     for (auto &p : this->currentPorts)
@@ -175,19 +237,12 @@ std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrC
             this->portValues[moduleName][pname] = body->getArgument(argIdx++);
         }
     }
-    // rst is the second block arg.
     b.setInsertionPointToStart(body);
     this->currentReset = body->getArgument(1);
 
-    // Visit shared variables first so they exist before states reference them.
-    if (auto blk = antlrCtx->machine_block())
-    {
-        if (auto sh = blk->decl_shared()) visit(sh);
-        if (auto st = blk->decl_states()) visit(st);
-    }
+    if (decl.sharedBlock) visit(decl.sharedBlock);
+    if (decl.statesBlock) visit(decl.statesBlock);
 
-    // ── Finalize: backpatch register inputs and emit module outputs ─────────
-    // 1. Variable registers: input <= varNext chain (or hold if no writes).
     for (auto &kv : this->varRegs[moduleName])
     {
         const std::string &name = kv.first;
@@ -195,14 +250,12 @@ std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrC
         mlir::Value next = this->varNext[moduleName][name];
         if (next) reg->setOperand(0, next);
     }
-    // 2. State register: input <= stateNext (defaults to hold if no goto).
     if (this->stateRegs.count(moduleName))
     {
         circt::seq::CompRegOp sreg = this->stateRegs[moduleName];
         mlir::Value next = this->stateNext[moduleName];
         if (next) sreg->setOperand(0, next);
     }
-    // 3. Output ports: wrap (data, valid) into a channel and emit hw.output.
     llvm::SmallVector<mlir::Value, 4> outputOperands;
     for (auto &p : this->currentPorts)
     {
@@ -224,37 +277,33 @@ std::any LowerVisitor::visitDecl_machine(castParser::Decl_machineContext *antlrC
     }
     circt::hw::OutputOp::create(b, loc, outputOperands);
 
-    // Restore builder to the top-level module so subsequent declarations
-    // (other machines, the instantiate block) land at the right scope.
     b.setInsertionPointToEnd(this->topModule.getBody());
 
     return std::any();
 }
 
-std::any LowerVisitor::visitDecl_interface(castParser::Decl_interfaceContext *antlrCtx)
+std::any LowerVisitor::visitDecl_interface(ast::InterfaceBlock &block)
 {
-    // Each io declaration adds one ESI-channel port per ident.
-    for (auto decl : antlrCtx->interface_block()->decl_io())
+    for (auto &decl : block.ioDecls)
     {
-        auto typedIdent = decl->ident_typed();
-        auto idents = decl->ident();
-        for (auto id : idents)
+        for (auto &id : decl.idents)
         {
             circt::hw::PortInfo port;
-            port.name = builder.getStringAttr(id->getText());
-            auto maybeType = getMlirType(typedIdent);
+            port.name = builder.getStringAttr(id);
+            auto maybeType = getMlirType(decl.typedIdent.type);
             mlir::Type inner = maybeType.value_or(builder.getI8Type());
             port.type = circt::esi::ChannelType::get(&this->ctx, inner);
-            this->channels[id->getText()] = port.type;
-            switch (decl->direction->getType())
+            this->channels[id] = port.type;
+            if (decl.direction == "input")
             {
-            case castLexer::INPUT:
                 port.dir = circt::hw::ModulePort::Direction::Input;
-                break;
-            case castLexer::OUTPUT:
+            }
+            else if (decl.direction == "output")
+            {
                 port.dir = circt::hw::ModulePort::Direction::Output;
-                break;
-            default:
+            }
+            else
+            {
                 std::cerr << "Error: machine port must be 'input' or 'output'.\n";
                 exit(1);
             }
@@ -264,24 +313,21 @@ std::any LowerVisitor::visitDecl_interface(castParser::Decl_interfaceContext *an
     return std::any();
 }
 
-std::any LowerVisitor::visitDecl_shared(castParser::Decl_sharedContext *antlrCtx)
+std::any LowerVisitor::visitDecl_shared(ast::SharedBlock &block)
 {
     mlir::Location loc = builder.getUnknownLoc();
-    for (auto v : antlrCtx->shared_block()->decl_var())
+    for (auto &v : block.varDecls)
     {
-        auto typedIdent = v->ident_typed();
-        auto maybeType = getMlirType(typedIdent);
+        auto maybeType = getMlirType(v->typedIdent.type);
         if (!maybeType) continue;
-        for (auto id : typedIdent->ident())
+        for (auto &id : v->typedIdent.idents)
         {
-            std::string name = id->getText();
+            std::string name = id;
             this->variables[this->currentModuleName][name] = maybeType.value();
             mlir::Value zero = circt::hw::ConstantOp::create(builder, loc, maybeType.value(), 0);
-            // Register starts with `zero` as a placeholder input — backpatched after states lower.
             circt::seq::CompRegOp reg = circt::seq::CompRegOp::create(
                 builder, loc, zero, this->currentClock, this->currentReset, zero);
             this->varRegs[this->currentModuleName][name] = reg;
-            // The default next-value is the register's own output (hold).
             this->varNext[this->currentModuleName][name] = reg.getResult();
         }
     }
@@ -292,13 +338,10 @@ std::any LowerVisitor::visitDecl_shared(castParser::Decl_sharedContext *antlrCtx
 // State machine
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::any LowerVisitor::visitDecl_states(castParser::Decl_statesContext *antlrCtx)
+std::any LowerVisitor::visitDecl_states(ast::StatesBlock &block)
 {
     mlir::Location loc = builder.getUnknownLoc();
-    auto sblock = antlrCtx->states_block();
-
-    // Assign integer encodings to each state and create the state register.
-    auto stateDecls = sblock->decl_state();
+    auto &stateDecls = block.stateDecls;
     if (stateDecls.empty()) return std::any();
 
     unsigned needed = 1;
@@ -307,23 +350,19 @@ std::any LowerVisitor::visitDecl_states(castParser::Decl_statesContext *antlrCtx
     mlir::Type stateTy = builder.getIntegerType(needed);
 
     uint32_t id = 0;
-    for (auto sd : stateDecls)
+    for (auto &sd : stateDecls)
     {
-        std::string name = sd->ident()->getText();
+        std::string name = sd->name;
         this->stateIds[this->currentModuleName][name] = id;
         ++id;
     }
 
-    // The first declared state (id 0) is the reset state.
     mlir::Value resetVal = circt::hw::ConstantOp::create(builder, loc, stateTy, 0);
-    // Placeholder input — backpatched after we visit each state body.
     circt::seq::CompRegOp stateReg = circt::seq::CompRegOp::create(
         builder, loc, resetVal, this->currentClock, this->currentReset, resetVal);
     this->stateRegs[this->currentModuleName] = stateReg;
-    // Default next-state = hold the current value.
     this->stateNext[this->currentModuleName] = stateReg.getResult();
 
-    // Build "state == X" comparators for each state.
     for (auto &kv : this->stateIds[this->currentModuleName])
     {
         mlir::Value sId = circt::hw::ConstantOp::create(builder, loc, stateTy, kv.second);
@@ -332,20 +371,18 @@ std::any LowerVisitor::visitDecl_states(castParser::Decl_statesContext *antlrCtx
         this->stateActive[this->currentModuleName][kv.first] = eq;
     }
 
-    // Now lower each state body. The state-active signal becomes the fire mask.
-    for (auto sd : stateDecls)
+    for (auto &sd : stateDecls)
         visit(sd);
 
     return std::any();
 }
 
-std::any LowerVisitor::visitDecl_state(castParser::Decl_stateContext *antlrCtx)
+std::any LowerVisitor::visitDecl_state(ast::StateDecl &decl)
 {
-    std::string name = antlrCtx->ident()->getText();
+    std::string name = decl.name;
     mlir::Value active = this->stateActive[this->currentModuleName][name];
     if (!active) return std::any();
 
-    // Save outer context, push state context.
     mlir::Value prevFire = this->currentFire;
     std::string prevName = this->currentStateName;
     bool prevIn = this->inStateBody;
@@ -355,19 +392,13 @@ std::any LowerVisitor::visitDecl_state(castParser::Decl_stateContext *antlrCtx)
     this->inStateBody = true;
     this->localBindings.clear();
 
-    // State entry guards: channel receives that gate the state.
-    // While inStateHeader is true, visitStmt_binary will narrow currentFire
-    // to (active && valid) and bind each received variable as a local so the
-    // body sees the just-received value instead of the stale register output.
     this->inStateHeader = true;
-    for (auto sb : antlrCtx->stmt_binary())
+    for (auto &sb : decl.headerReceives)
         visit(sb);
     this->inStateHeader = false;
-    // currentFire is now (active && valid1 && valid2 && ...) for all header receives.
 
-    // Body block.
-    if (auto blk = antlrCtx->stmt_block())
-        for (auto s : blk->stmt())
+    if (decl.body)
+        for (auto &s : decl.body->statements)
             visit(s);
 
     this->localBindings.clear();
@@ -377,19 +408,9 @@ std::any LowerVisitor::visitDecl_state(castParser::Decl_stateContext *antlrCtx)
     return std::any();
 }
 
-std::any LowerVisitor::visitStmt_nextstate(castParser::Stmt_nextstateContext *antlrCtx)
+std::any LowerVisitor::visitStmt_nextstate(ast::GotoStmt &stmt)
 {
-    // `nextstate <ident>` and `goto <ident>` both transition the FSM.
-    // Find the target by scanning children for the state name.
-    std::string target;
-    for (auto c : antlrCtx->children)
-    {
-        if (auto ident = dynamic_cast<castParser::IdentContext *>(c))
-        {
-            target = ident->getText();
-            break;
-        }
-    }
+    std::string target = stmt.targetState;
     if (target.empty()) return std::any();
 
     auto &ids = this->stateIds[this->currentModuleName];
@@ -401,33 +422,27 @@ std::any LowerVisitor::visitStmt_nextstate(castParser::Stmt_nextstateContext *an
     mlir::Type stateTy = sreg.getResult().getType();
     mlir::Value targetId = circt::hw::ConstantOp::create(builder, loc, stateTy, it->second);
 
-    // Append: stateNext = mux(currentFire, targetId, stateNext_prev)
     mlir::Value prev = this->stateNext[this->currentModuleName];
     mlir::Value next = circt::comb::MuxOp::create(builder, loc, this->currentFire, targetId, prev);
     this->stateNext[this->currentModuleName] = next;
     return std::any();
 }
 
-// Lower print("literal", val, ...) → always_ff @(posedge clk) if(fire) $fwrite(...)
-// Each print fires exactly once per cycle the owning state is active.
-std::any LowerVisitor::visitExpr_func_call(castParser::Expr_func_callContext *antlrCtx)
+std::any LowerVisitor::visitExpr_func_call(ast::CallExpr &expr)
 {
-    std::string funcName = antlrCtx->func_name()->getText();
+    std::string funcName = expr.funcName;
     if (funcName != "print" || !this->inStateBody || !this->currentFire)
         return std::any();
 
     mlir::Location loc = builder.getUnknownLoc();
 
-    // Build the $fwrite format string and collect runtime value substitutions.
-    // String literals become verbatim text; all other exprs become %0d.
     std::string fmtStr;
     llvm::SmallVector<mlir::Value, 4> subs;
-    for (auto argExpr : antlrCtx->expr())
+    for (auto &argExpr : expr.args)
     {
-        if (argExpr->string_literal())
+        if (argExpr->getKind() == ast::ASTNodeKind::StringLiteral)
         {
-            std::string raw = argExpr->string_literal()->getText();
-            if (raw.size() >= 2) raw = raw.substr(1, raw.size() - 2); // strip quotes
+            std::string raw = static_cast<ast::StringLiteral*>(argExpr.get())->value;
             fmtStr += raw;
         }
         else
@@ -442,12 +457,9 @@ std::any LowerVisitor::visitExpr_func_call(castParser::Expr_func_callContext *an
     }
     fmtStr += "\n";
 
-    // sv.alwaysff needs i1; convert from seq.clock.
     mlir::Value i1Clk = circt::seq::FromClockOp::create(builder, loc, this->currentClock);
-    // Capture by value so the lambdas are self-contained.
     mlir::Value fire = this->currentFire;
     mlir::StringAttr fmtAttr = builder.getStringAttr(fmtStr);
-    // stdout MCD in Verilog: 32'h80000001
     mlir::Value fd = circt::hw::ConstantOp::create(
         builder, loc, builder.getIntegerType(32), 0x80000001LL);
 
@@ -467,44 +479,32 @@ std::any LowerVisitor::visitExpr_func_call(castParser::Expr_func_callContext *an
 // Expression / identifier resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::optional<mlir::Type> LowerVisitor::getMlirType(castParser::Ident_typedContext *typedIdentCtx)
+std::optional<mlir::Type> LowerVisitor::getMlirType(const ast::Type &t)
 {
-    auto typeCtx = typedIdentCtx->type();
-    if (!typeCtx) return std::nullopt;
-    auto litCtx = typeCtx->type_lit();
-    if (!litCtx) return std::nullopt;
-    size_t tokenType = litCtx->getStart()->getType();
-    switch (tokenType)
+    if (t.kind == ast::TypeKind::PRIMITIVE)
     {
-    // All hardware values are signless integers — comb ops require this.
-    // Signedness is a language-level concept handled by op selection (e.g.
-    // DivU vs DivS, ICmp ult vs slt) rather than carried in the type.
-    case castLexer::T_INTEGER: return builder.getI32Type();
-    case castLexer::T_BYTE:    return builder.getI8Type();
-    case castLexer::T_INT32:   return builder.getI32Type();
-    case castLexer::T_UINT32:  return builder.getIntegerType(32);
-    case castLexer::T_UINT16:  return builder.getIntegerType(16);
-    case castLexer::T_BOOL:    return builder.getI1Type();
-    case castLexer::T_STRING:  return circt::hw::StringType::get(&this->ctx);
+        if (t.name == "int") return builder.getI32Type();
+        if (t.name == "byte") return builder.getI8Type();
+        if (t.name == "int32") return builder.getI32Type();
+        if (t.name == "uint32") return builder.getIntegerType(32);
+        if (t.name == "uint16") return builder.getIntegerType(16);
+        if (t.name == "bool") return builder.getI1Type();
+        if (t.name == "string") return circt::hw::StringType::get(&this->ctx);
     }
     return std::nullopt;
 }
 
-std::any LowerVisitor::visitIdent(castParser::IdentContext *antlrCtx)
+std::any LowerVisitor::visitIdent(ast::IdentExpr &expr)
 {
-    std::string name = antlrCtx->getText();
-    // 0. State-header local binding — the just-received channel data.
+    std::string name = expr.name;
     if (this->localBindings.count(name))
         return mlir::Value(this->localBindings[name]);
-    // 1. Shared variable register read
     if (this->varRegs.count(this->currentModuleName) &&
         this->varRegs[this->currentModuleName].count(name))
         return mlir::Value(this->varRegs[this->currentModuleName][name].getResult());
-    // 2. Interface port (block argument)
     if (this->portValues.count(this->currentModuleName) &&
         this->portValues[this->currentModuleName].count(name))
         return this->portValues[this->currentModuleName][name];
-    // 3. Enum member literal
     if (this->enumValues.count(name))
     {
         auto [val, w] = this->enumValues[name];
@@ -514,73 +514,56 @@ std::any LowerVisitor::visitIdent(castParser::IdentContext *antlrCtx)
     return std::any();
 }
 
-std::any LowerVisitor::visitNumber_literal(castParser::Number_literalContext *antlrCtx)
+std::any LowerVisitor::visitNumber_literal(ast::NumberLiteral &expr)
 {
-    int64_t value = std::stoll(antlrCtx->getText(), nullptr, 0);
-    // Use the surrounding type hint when available; otherwise default to i32.
+    int64_t value = expr.value;
     mlir::Type t = this->currentExprType ? this->currentExprType : builder.getI32Type();
     if (!mlir::isa<mlir::IntegerType>(t)) t = builder.getI32Type();
     return mlir::Value(circt::hw::ConstantOp::create(
         builder, builder.getUnknownLoc(), t, value));
 }
 
-std::any LowerVisitor::visitType_lit(castParser::Type_litContext *antlrCtx)
-{
-    return antlrCtx->getStart()->getType();
-}
-
-std::any LowerVisitor::visitAssignment_op(castParser::Assignment_opContext *antlrCtx)
-{
-    return antlrCtx->getStart()->getType();
-}
-
-// expr can be: ident | ident_field | literal | '(' expr ')' | unary expr |
-//              expr [..] | expr (...) | expr bin_op expr | expr update_op | expr_func_call.
-// We dispatch by inspecting which children are present.
-std::any LowerVisitor::visitExpr(castParser::ExprContext *antlrCtx)
+std::any LowerVisitor::visitExpr(ast::Expr &expr)
 {
     mlir::Location loc = builder.getUnknownLoc();
 
-    // Single-child terminals: ident, ident_field, literals, expr_func_call.
-    if (antlrCtx->ident()) return visit(antlrCtx->ident());
-    if (antlrCtx->ident_field()) return visit(antlrCtx->ident_field());
-    if (antlrCtx->number_literal()) return visit(antlrCtx->number_literal());
-    if (antlrCtx->string_literal()) notImplemented("string literals in expressions");
-    if (antlrCtx->nil_literal()) notImplemented("nil literals");
-    if (antlrCtx->expr_func_call()) return visit(antlrCtx->expr_func_call());
+    if (expr.getKind() == ast::ASTNodeKind::IdentExpr)
+        return visitIdent(static_cast<ast::IdentExpr&>(expr));
+    if (expr.getKind() == ast::ASTNodeKind::FieldExpr)
+        return visitIdent_field(static_cast<ast::FieldExpr&>(expr));
+    if (expr.getKind() == ast::ASTNodeKind::NumberLiteral)
+        return visitNumber_literal(static_cast<ast::NumberLiteral&>(expr));
+    if (expr.getKind() == ast::ASTNodeKind::StringLiteral)
+        notImplemented("string literals in expressions");
+    if (expr.getKind() == ast::ASTNodeKind::NilLiteral)
+        notImplemented("nil literals");
+    if (expr.getKind() == ast::ASTNodeKind::CallExpr)
+        return visitExpr_func_call(static_cast<ast::CallExpr&>(expr));
 
-    auto subExprs = antlrCtx->expr();
-
-    // Parenthesised: '(' expr ')'.
-    if (subExprs.size() == 1 && !antlrCtx->unary_op() && !antlrCtx->update_op())
-        return visit(subExprs[0]);
-
-    // Unary: unary_op expr.
-    if (antlrCtx->unary_op() && subExprs.size() == 1)
+    if (expr.getKind() == ast::ASTNodeKind::UnaryExpr)
     {
-        auto inner = visit(subExprs[0]);
+        auto &un = static_cast<ast::UnaryExpr&>(expr);
+        auto inner = visit(un.expr);
         if (!inner.has_value()) return std::any();
         mlir::Value v = std::any_cast<mlir::Value>(inner);
-        std::string opTxt = antlrCtx->unary_op()->getText();
-        if (opTxt == "!")
+        if (un.op == "!")
         {
             mlir::Value one = circt::hw::ConstantOp::create(builder, loc, v.getType(), 1);
             return mlir::Value(circt::comb::XorOp::create(builder, loc, v, one));
         }
-        notImplemented("unary operator '" + opTxt + "'");
+        notImplemented("unary operator '" + un.op + "'");
     }
 
-    // Binary: expr bin_op expr.
-    if (antlrCtx->bin_op() && subExprs.size() == 2)
+    if (expr.getKind() == ast::ASTNodeKind::BinaryExpr)
     {
-        auto la = visit(subExprs[0]);
-        auto ra = visit(subExprs[1]);
+        auto &bin = static_cast<ast::BinaryExpr&>(expr);
+        auto la = visit(bin.lhs);
+        auto ra = visit(bin.rhs);
         if (!la.has_value() || !ra.has_value()) return std::any();
         mlir::Value lhs = std::any_cast<mlir::Value>(la);
         mlir::Value rhs = std::any_cast<mlir::Value>(ra);
         if (!lhs || !rhs) return std::any();
 
-        // Width-equalize if both are integer.
         auto li = mlir::dyn_cast<mlir::IntegerType>(lhs.getType());
         auto ri = mlir::dyn_cast<mlir::IntegerType>(rhs.getType());
         if (li && ri && li.getWidth() != ri.getWidth())
@@ -591,7 +574,7 @@ std::any LowerVisitor::visitExpr(castParser::ExprContext *antlrCtx)
             rhs = coerce(rhs, wide, loc);
         }
 
-        std::string op = antlrCtx->bin_op()->getText();
+        std::string op = bin.op;
         if (op == "+")  return mlir::Value(circt::comb::AddOp::create(builder, loc, lhs, rhs));
         if (op == "-")  return mlir::Value(circt::comb::SubOp::create(builder, loc, lhs, rhs));
         if (op == "*")  return mlir::Value(circt::comb::MulOp::create(builder, loc, lhs, rhs));
@@ -613,23 +596,21 @@ std::any LowerVisitor::visitExpr(castParser::ExprContext *antlrCtx)
         notImplemented("binary operator '" + op + "'");
     }
 
-    // Update: expr++ / expr-- — when the operand is a known variable, emit a
-    // dataflow-conditional increment/decrement of its register. Returns the
-    // current value so the expression can also be used as an rvalue.
-    if (antlrCtx->update_op() && subExprs.size() == 1)
+    if (expr.getKind() == ast::ASTNodeKind::UpdateExpr)
     {
-        auto inner = visit(subExprs[0]);
+        auto &upd = static_cast<ast::UpdateExpr&>(expr);
+        auto inner = visit(upd.expr);
         if (!inner.has_value()) return std::any();
         mlir::Value v = std::any_cast<mlir::Value>(inner);
         if (!v) return std::any();
 
-        if (auto idCtx = subExprs[0]->ident())
+        if (upd.expr->getKind() == ast::ASTNodeKind::IdentExpr)
         {
-            std::string nm = idCtx->getText();
+            std::string nm = static_cast<ast::IdentExpr*>(upd.expr.get())->name;
             if (this->varRegs[this->currentModuleName].count(nm) && this->currentFire)
             {
                 mlir::Value one = circt::hw::ConstantOp::create(builder, loc, v.getType(), 1);
-                std::string opTxt = antlrCtx->update_op()->getText();
+                std::string opTxt = upd.op;
                 mlir::Value updated = (opTxt == "--")
                     ? mlir::Value(circt::comb::SubOp::create(builder, loc, v, one))
                     : mlir::Value(circt::comb::AddOp::create(builder, loc, v, one));
@@ -639,85 +620,17 @@ std::any LowerVisitor::visitExpr(castParser::ExprContext *antlrCtx)
         return v;
     }
 
-    // Function call: expr '(' args ')' — first subExpr is the callee ident.
-    // This is the left-recursive parse form for calls like print("msg", val).
-    if (subExprs.size() >= 1 && !antlrCtx->bin_op() &&
-        !antlrCtx->unary_op() && !antlrCtx->update_op() && subExprs[0]->ident())
-    {
-        bool isFuncCall = false;
-        for (auto *c : antlrCtx->children)
-            if (auto *t = dynamic_cast<antlr4::tree::TerminalNode *>(c))
-                if (t->getText() == "(") { isFuncCall = true; break; }
-
-        if (isFuncCall)
-        {
-            std::string funcName = subExprs[0]->ident()->getText();
-            if (funcName == "print" && this->inStateBody && this->currentFire)
-            {
-                std::string fmtStr;
-                llvm::SmallVector<mlir::Value, 4> subs;
-                // subExprs[0] is the callee; [1..] are the arguments.
-                for (size_t i = 1; i < subExprs.size(); ++i)
-                {
-                    auto *arg = subExprs[i];
-                    if (arg->string_literal())
-                    {
-                        std::string raw = arg->string_literal()->getText();
-                        if (raw.size() >= 2) raw = raw.substr(1, raw.size() - 2);
-                        fmtStr += raw;
-                    }
-                    else
-                    {
-                        auto a = visit(arg);
-                        if (a.has_value() && a.type() == typeid(mlir::Value))
-                        {
-                            mlir::Value v2 = std::any_cast<mlir::Value>(a);
-                            if (v2) { fmtStr += "%0d"; subs.push_back(v2); }
-                        }
-                    }
-                }
-                fmtStr += "\n";
-
-                // sv.alwaysff needs i1; convert from seq.clock.
-                mlir::Value i1Clk = circt::seq::FromClockOp::create(builder, loc, this->currentClock);
-                mlir::Value fire  = this->currentFire;
-                mlir::StringAttr fmtAttr = builder.getStringAttr(fmtStr);
-                // stdout MCD in Verilog: 32'h80000001
-                mlir::Value fd = circt::hw::ConstantOp::create(
-                    builder, loc, builder.getIntegerType(32), 0x80000001LL);
-
-                circt::sv::AlwaysFFOp::create(builder, loc,
-                    circt::sv::EventControl::AtPosEdge, i1Clk,
-                    [&]() {
-                        circt::sv::IfOp::create(builder, loc, fire,
-                            [&]() {
-                                circt::sv::FWriteOp::create(builder, loc, fd, fmtAttr, subs);
-                            });
-                    });
-            }
-            return std::any();
-        }
-    }
-
-    // Array/slice indexing: expr '[' ... ']' — not yet supported.
-    for (auto *c : antlrCtx->children)
-        if (auto *t = dynamic_cast<antlr4::tree::TerminalNode *>(c))
-            if (t->getText() == "[") notImplemented("array/slice indexing");
-
-    return visitChildren(antlrCtx);
+    return std::any();
 }
 
-std::any LowerVisitor::visitDecl_var(castParser::Decl_varContext *antlrCtx)
+std::any LowerVisitor::visitDecl_var(ast::VarDecl &decl)
 {
-    // `var T name (= expr)?` — when used inside a state, treat it as a local
-    // shared variable: allocate a register and seed with the rhs if present.
-    auto typedIdent = antlrCtx->ident_typed();
-    auto maybeType = getMlirType(typedIdent);
+    auto maybeType = getMlirType(decl.typedIdent.type);
     if (!maybeType) return std::any();
     mlir::Location loc = builder.getUnknownLoc();
-    for (auto id : typedIdent->ident())
+    for (auto &id : decl.typedIdent.idents)
     {
-        std::string name = id->getText();
+        std::string name = id;
         if (this->varRegs[this->currentModuleName].count(name)) continue;
         this->variables[this->currentModuleName][name] = maybeType.value();
         mlir::Value zero = circt::hw::ConstantOp::create(builder, loc, maybeType.value(), 0);
@@ -726,14 +639,14 @@ std::any LowerVisitor::visitDecl_var(castParser::Decl_varContext *antlrCtx)
         this->varRegs[this->currentModuleName][name] = reg;
         this->varNext[this->currentModuleName][name] = reg.getResult();
     }
-    if (antlrCtx->expr())
+    if (decl.initExpr)
     {
-        auto rhs = visit(antlrCtx->expr());
+        auto rhs = visit(decl.initExpr);
         if (rhs.has_value() && this->currentFire)
         {
             mlir::Value v = std::any_cast<mlir::Value>(rhs);
-            if (v && !typedIdent->ident().empty())
-                writeVar(typedIdent->ident()[0]->getText(), v, this->currentFire);
+            if (v && !decl.typedIdent.idents.empty())
+                writeVar(decl.typedIdent.idents[0], v, this->currentFire);
         }
     }
     return std::any();
@@ -743,21 +656,19 @@ std::any LowerVisitor::visitDecl_var(castParser::Decl_varContext *antlrCtx)
 // Statements
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::any LowerVisitor::visitStmt(castParser::StmtContext *antlrCtx)
+std::any LowerVisitor::visitStmt(ast::Stmt &stmt)
 {
-    return visitChildren(antlrCtx);
+    return visit(&stmt);
 }
 
-std::any LowerVisitor::visitStmt_if(castParser::Stmt_ifContext *antlrCtx)
+std::any LowerVisitor::visitStmt_if(ast::IfStmt &stmt)
 {
-    // if <expr> { thenBlock } (else (block | ifChain))?
-    // Predicate-gate the body by ANDing currentFire with the condition.
     mlir::Location loc = builder.getUnknownLoc();
-    auto condA = visit(antlrCtx->expr());
+    auto condA = visit(stmt.cond);
     if (!condA.has_value()) return std::any();
     mlir::Value cond = std::any_cast<mlir::Value>(condA);
     if (!cond) return std::any();
-    // Force cond to i1
+
     if (auto it = mlir::dyn_cast<mlir::IntegerType>(cond.getType()))
         if (it.getWidth() != 1)
             cond = circt::comb::ICmpOp::create(
@@ -769,53 +680,45 @@ std::any LowerVisitor::visitStmt_if(castParser::Stmt_ifContext *antlrCtx)
         ? mlir::Value(circt::comb::AndOp::create(builder, loc, outerFire, cond))
         : cond;
 
-    auto blocks = antlrCtx->stmt_block();
-    if (!blocks.empty())
+    if (stmt.thenBranch)
     {
         this->currentFire = thenFire;
-        for (auto s : blocks[0]->stmt()) visit(s);
+        for (auto &s : stmt.thenBranch->statements) visit(s);
         this->currentFire = outerFire;
     }
-    // else-branch: invert cond.
+
     mlir::Value notCond = circt::comb::XorOp::create(
         builder, loc, cond,
         circt::hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1));
     mlir::Value elseFire = outerFire
         ? mlir::Value(circt::comb::AndOp::create(builder, loc, outerFire, notCond))
         : notCond;
-    if (blocks.size() > 1)
+
+    if (stmt.elseBranch)
     {
         this->currentFire = elseFire;
-        for (auto s : blocks[1]->stmt()) visit(s);
-        this->currentFire = outerFire;
-    }
-    else if (auto chained = antlrCtx->stmt_if())
-    {
-        this->currentFire = elseFire;
-        visit(chained);
+        visit(stmt.elseBranch);
         this->currentFire = outerFire;
     }
     return std::any();
 }
 
-std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx)
+std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt)
 {
     mlir::Location loc = builder.getUnknownLoc();
-    size_t op = antlrCtx->assignment_op()->getStart()->getType();
+    std::string op = stmt.op;
 
-    auto lhsExpr = antlrCtx->expr(0);
-    auto rhsExpr = antlrCtx->expr(1);
+    auto lhsExpr = stmt.lhs;
+    auto rhsExpr = stmt.rhs;
 
-    // Determine LHS lvalue kind without polluting register-read paths.
     std::string lhsName;
     bool lhsIsVar = false;
-    if (lhsExpr->ident())
+    if (lhsExpr->getKind() == ast::ASTNodeKind::IdentExpr)
     {
-        lhsName = lhsExpr->ident()->getText();
+        lhsName = static_cast<ast::IdentExpr*>(lhsExpr.get())->name;
         lhsIsVar = true;
     }
 
-    // Visit RHS for value.
     mlir::Type hint;
     if (lhsIsVar && this->variables[this->currentModuleName].count(lhsName))
         hint = this->variables[this->currentModuleName][lhsName];
@@ -827,42 +730,36 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
     if (rhsAny.has_value() && rhsAny.type() == typeid(mlir::Value))
         rhsVal = std::any_cast<mlir::Value>(rhsAny);
 
-    // The fire condition for this statement.
     mlir::Value fire = this->currentFire
         ? this->currentFire
         : circt::hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
 
-    // ── Channel arrow ops (`<-` and `->`) ────────────────────────────────────
-    // Normalize to (sourceExpr, destExpr) using the arrow direction:
-    //   `lhs <- rhs`  →  data flows rhs → lhs   (source=rhs, dest=lhs)
-    //   `lhs -> rhs`  →  data flows lhs → rhs   (source=lhs, dest=rhs)
-    // Then dispatch by what each side is (channel port vs variable).
-    if (op == castLexer::ASSIGN_CHANNEL_RECEIVE || op == castLexer::ASSIGN_CHANNEL_SEND)
+    if (op == "<-" || op == "->")
     {
-        bool rev = (op == castLexer::ASSIGN_CHANNEL_SEND);
-        castParser::ExprContext *srcExpr = rev ? lhsExpr : rhsExpr;
-        castParser::ExprContext *dstExpr = rev ? rhsExpr : lhsExpr;
+        bool rev = (op == "->");
+        auto srcExpr = rev ? lhsExpr : rhsExpr;
+        auto dstExpr = rev ? rhsExpr : lhsExpr;
 
-        // Names for the destination (if it's an ident or instance.port).
         std::string dstName;
         std::string dstInst, dstPort;
         bool dstIsIdent = false, dstIsField = false;
-        if (dstExpr->ident()) { dstName = dstExpr->ident()->getText(); dstIsIdent = true; }
-        else if (dstExpr->ident_field())
+        if (dstExpr->getKind() == ast::ASTNodeKind::IdentExpr)
         {
-            dstInst = dstExpr->ident_field()->ident(0)->getText();
-            dstPort = dstExpr->ident_field()->ident(1)->getText();
+            dstName = static_cast<ast::IdentExpr*>(dstExpr.get())->name;
+            dstIsIdent = true;
+        }
+        else if (dstExpr->getKind() == ast::ASTNodeKind::FieldExpr)
+        {
+            dstInst = static_cast<ast::FieldExpr*>(dstExpr.get())->object;
+            dstPort = static_cast<ast::FieldExpr*>(dstExpr.get())->field;
             dstIsField = true;
         }
 
-        // Source value — visit and try to extract a channel or scalar value.
         auto srcAny = visit(srcExpr);
         mlir::Value srcVal;
         if (srcAny.has_value() && srcAny.type() == typeid(mlir::Value))
             srcVal = std::any_cast<mlir::Value>(srcAny);
 
-        // Case A: source is an ESI channel → receive (always-ready dataflow)
-        // and capture into the destination variable.
         if (srcVal)
         {
             if (auto chSrc = mlir::dyn_cast<mlir::TypedValue<circt::esi::ChannelType>>(srcVal))
@@ -876,7 +773,6 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
 
                 if (dstIsIdent)
                 {
-                    // Auto-declare the destination as a register if unknown.
                     if (!this->varRegs[this->currentModuleName].count(dstName))
                     {
                         mlir::Value zero = circt::hw::ConstantOp::create(builder, loc, inner, 0);
@@ -889,10 +785,7 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
                     writeVar(dstName, data, cond);
                     if (this->inStateHeader)
                     {
-                        // Gate the body on this channel being valid.
                         this->currentFire = cond;
-                        // Bind to the received data so reads in this state
-                        // see the new value rather than the stale register.
                         this->localBindings[dstName] = data;
                     }
                 }
@@ -900,13 +793,10 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
             }
         }
 
-        // Case B: destination is an output port → drive it with the source value.
-        // Output ports aren't block arguments, so look up by direction map only.
         if (dstIsIdent && this->portDirs[this->currentModuleName].count(dstName) &&
             this->portDirs[this->currentModuleName][dstName] ==
                 circt::hw::ModulePort::Direction::Output && srcVal)
         {
-            // Find the port's type from the recorded port list.
             mlir::Type portType;
             for (auto &p : this->currentPorts)
                 if (p.name == dstName) { portType = p.type; break; }
@@ -926,8 +816,6 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
             return std::any();
         }
 
-        // Case C: destination is `instance.port` — patch the FIFO feed registers
-        // so the instance receives the specified value continuously.
         if (dstIsField && this->insideInsantiate && srcVal)
         {
             auto instIt = this->instanceFifoRegs.find(dstInst);
@@ -941,7 +829,6 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
                     mlir::Value data = coerce(srcVal, innerTy, loc);
                     mlir::Value trueV = circt::hw::ConstantOp::create(
                         builder, loc, builder.getI1Type(), 1);
-                    // operand 0 = input, operand 3 = resetValue
                     dataReg->setOperand(0, data);
                     dataReg->setOperand(3, data);
                     validReg->setOperand(0, trueV);
@@ -952,41 +839,45 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
         return std::any();
     }
 
-    // ── Compound + plain assignments to a shared variable ───────────────────
     if (lhsIsVar && this->varRegs[this->currentModuleName].count(lhsName) && rhsVal)
     {
         mlir::Value current = readVar(lhsName);
         mlir::Value newVal;
-        switch (op)
+        if (op == "=" || op == ":=")
         {
-        case castLexer::ASSIGN:
-        case castLexer::ASSIGN_WALRUS:
             newVal = rhsVal;
-            break;
-        case castLexer::ASSIGN_ADD:
+        }
+        else if (op == "+=")
+        {
             newVal = circt::comb::AddOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_SUB:
+        }
+        else if (op == "-=")
+        {
             newVal = circt::comb::SubOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_MUL:
+        }
+        else if (op == "*=")
+        {
             newVal = circt::comb::MulOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_DIV:
+        }
+        else if (op == "/=")
+        {
             newVal = circt::comb::DivUOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_XOR:
+        }
+        else if (op == "^=")
+        {
             newVal = circt::comb::XorOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_SHL:
+        }
+        else if (op == "<<=")
+        {
             newVal = circt::comb::ShlOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        case castLexer::ASSIGN_SHR:
+        }
+        else if (op == ">>=")
+        {
             newVal = circt::comb::ShrUOp::create(builder, loc, current, coerce(rhsVal, current.getType(), loc));
-            break;
-        default:
+        }
+        else
+        {
             newVal = rhsVal;
-            break;
         }
         writeVar(lhsName, newVal, fire);
         return std::any();
@@ -999,12 +890,8 @@ std::any LowerVisitor::visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx
 // Instantiation (top-level)
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::any LowerVisitor::visitDecl_instantiate(castParser::Decl_instantiateContext *antlrCtx)
+std::any LowerVisitor::visitDecl_instantiate(ast::InstantiateDecl &decl)
 {
-    // Wrap the instantiate block in a top-level `Main` HWModule so all the
-    // FIFOs and instances live inside a hw.module (otherwise SSA values like
-    // %arg0 have no defining scope). Main has a single `clk` port, which
-    // every nested machine instance shares.
     mlir::Location loc = builder.getUnknownLoc();
     builder.setInsertionPointToEnd(this->topModule.getBody());
 
@@ -1042,9 +929,13 @@ std::any LowerVisitor::visitDecl_instantiate(castParser::Decl_instantiateContext
     this->varNext[moduleName];
     this->currentModuleName = moduleName;
 
-    std::any result = visitChildren(antlrCtx);
+    std::any result;
+    if (decl.body) {
+        for (auto &s : decl.body->statements) {
+            result = visit(s);
+        }
+    }
 
-    // Terminate Main with a parameterless hw.output (no outputs declared).
     circt::hw::OutputOp::create(builder, loc, mlir::ValueRange{});
     builder.setInsertionPointToEnd(this->topModule.getBody());
 
@@ -1052,10 +943,10 @@ std::any LowerVisitor::visitDecl_instantiate(castParser::Decl_instantiateContext
     return result;
 }
 
-std::any LowerVisitor::visitInst_module(castParser::Inst_moduleContext *antlrCtx)
+std::any LowerVisitor::visitInst_module(ast::InstModuleStmt &stmt)
 {
-    std::string moduleName = antlrCtx->expr_func_call()->func_name()->getText();
-    std::string varName = antlrCtx->ident()->getText();
+    std::string moduleName = stmt.callExpr->funcName;
+    std::string varName = stmt.varName;
 
     if (!this->modules.contains(moduleName))
     {
@@ -1068,7 +959,6 @@ std::any LowerVisitor::visitInst_module(castParser::Inst_moduleContext *antlrCtx
 
     for (auto port : portInfo)
     {
-        // Output ports are results of hw.instance, not operands — skip them.
         if (port.dir == circt::hw::ModulePort::Direction::Output) continue;
 
         mlir::Type portType = port.type;
@@ -1079,7 +969,6 @@ std::any LowerVisitor::visitInst_module(castParser::Inst_moduleContext *antlrCtx
             mlir::Value dummyValid = circt::hw::ConstantOp::create(builder, builder.getUnknownLoc(), builder.getI1Type(), 0);
             circt::seq::CompRegOp channel_data  = circt::seq::CompRegOp::create(builder, builder.getUnknownLoc(), dummyData,  this->currentClock, this->currentReset, dummyData);
             circt::seq::CompRegOp channel_valid = circt::seq::CompRegOp::create(builder, builder.getUnknownLoc(), dummyValid, this->currentClock, this->currentReset, dummyValid);
-            // Record so `varName.portName <- value` can patch operands 0 and 3.
             this->instanceFifoRegs[varName][port.name.str()] = {channel_data, channel_valid};
             circt::esi::WrapValidReadyOp vr = circt::esi::WrapValidReadyOp::create(
                 builder, builder.getUnknownLoc(), portType, builder.getI1Type(), channel_data, channel_valid);
@@ -1111,24 +1000,20 @@ std::any LowerVisitor::visitInst_module(castParser::Inst_moduleContext *antlrCtx
         exit(1);
     }
     this->instances[varName] = instance;
-    std::any result = visitChildren(antlrCtx);
-    return result;
+    return std::any();
 }
 
-std::any LowerVisitor::visitIdent_field(castParser::Ident_fieldContext *antlrCtx)
+std::any LowerVisitor::visitIdent_field(ast::FieldExpr &expr)
 {
     if (!this->insideInsantiate)
     {
-        // Inside a machine body, ident_field could be reading an instance's
-        // output port (cross-module wiring) — not currently supported.
         return std::any();
     }
-    auto inst = antlrCtx->ident(0)->getText();
-    auto port = antlrCtx->ident(1)->getText();
+    auto inst = expr.object;
+    auto port = expr.field;
     if (this->instances.count(inst))
     {
         circt::hw::InstanceOp op = this->instances[inst];
-        // Find the port index by name.
         auto plist = op.getPortList();
         unsigned outIdx = 0;
         for (auto &p : plist)
@@ -1142,45 +1027,27 @@ std::any LowerVisitor::visitIdent_field(castParser::Ident_fieldContext *antlrCtx
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Unimplemented grammar constructs — exit with an informative message
+// Dummy / Unimplemented declarations and statements
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::any LowerVisitor::visitStmt_for(castParser::Stmt_forContext *)
+std::any LowerVisitor::visitBlockStmt(ast::BlockStmt &stmt)
+{
+    for (auto &s : stmt.statements)
+        visit(s);
+    return std::any();
+}
+
+std::any LowerVisitor::visitForStmt(ast::ForStmt &)
 {
     notImplemented("for loops");
 }
 
-std::any LowerVisitor::visitStmt_switch(castParser::Stmt_switchContext *)
+std::any LowerVisitor::visitSwitchStmt(ast::SwitchStmt &)
 {
     notImplemented("switch statements");
 }
 
-std::any LowerVisitor::visitStmt_return(castParser::Stmt_returnContext *)
+std::any LowerVisitor::visitReturnStmt(ast::ReturnStmt &)
 {
     notImplemented("return statements");
-}
-
-std::any LowerVisitor::visitDecl_func(castParser::Decl_funcContext *)
-{
-    notImplemented("function declarations ('func')");
-}
-
-std::any LowerVisitor::visitDecl_type(castParser::Decl_typeContext *)
-{
-    notImplemented("type declarations ('type')");
-}
-
-std::any LowerVisitor::visitDecl_memory(castParser::Decl_memoryContext *)
-{
-    notImplemented("memory blocks ('memory')");
-}
-
-std::any LowerVisitor::visitDecl_exception(castParser::Decl_exceptionContext *)
-{
-    notImplemented("exception handlers ('exception')");
-}
-
-std::any LowerVisitor::visitDecl_assertions(castParser::Decl_assertionsContext *)
-{
-    notImplemented("assertion blocks ('assertions')");
 }

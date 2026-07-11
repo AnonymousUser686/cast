@@ -9,7 +9,7 @@ MLIR and the CIRCT compiler infrastructure.
 cast source (.cast)
        │
        ▼
-  ANTLR4 parser
+  Handwritten parser
        │  AST
        ▼
   MLIR/CIRCT lowering
@@ -45,9 +45,6 @@ cast source (.cast)
 | CMake ≥ 3.14, Ninja | Build system | `brew install cmake ninja` |
 | LLVM + MLIR | IR infrastructure | build from source (see below) |
 | CIRCT | HW/Seq/SV dialects | build from source (see below) |
-| ANTLR4 runtime (≥ 4.13) | Parser library | `brew install antlr4-cpp-runtime` |
-| ANTLR4 tool jar | Grammar compiler | download `antlr-4.13.2-complete.jar` |
-| Java (≥ 11) | Runs ANTLR tool | `brew install openjdk` |
 | iverilog | Simulation | `brew install icarus-verilog` |
 | gtkwave *(optional)* | Waveform viewer | `brew install gtkwave` |
 
@@ -496,9 +493,7 @@ the generated Verilog or replay the simulation without recompiling.
 
 ### Frontend
 
-The ANTLR4 grammar ([cast.g4](src/Frontend/antlr/cast.g4)) parses cast source into
-a concrete syntax tree. The visitor in [castLower.cpp](src/Frontend/castLower.cpp)
-walks the CST and emits MLIR operations directly, with no intermediate AST.
+The handwritten lexer and parser ([CastParser.cpp](src/Frontend/CastParser.cpp)) parse Cast source into an AST defined in [CastAST.hpp](src/Frontend/CastAST.hpp). The visitor in [castLower.cpp](src/Frontend/castLower.cpp) walks this AST and emits MLIR operations directly.
 
 ### MLIR/CIRCT lowering pipeline
 

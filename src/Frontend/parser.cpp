@@ -1,9 +1,9 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-#include "antlr4-runtime.h"
-#include "castLexer.h"
-#include "castParser.h"
+#include <streambuf>
+#include "CastParser.hpp"
+#include "CastAST.hpp"
 #include "castLower.hpp"
 #include <circt/Conversion/ExportVerilog.h>
 #include <circt/Conversion/SeqToSV.h>
@@ -12,8 +12,6 @@
 #include <circt/Dialect/HW/HWOps.h>
 #include <circt/Conversion/VerifToSV.h>
 #include <mlir/Pass/PassManager.h>
-
-using namespace antlr4;
 
 static void printUsage(const char *prog)
 {
@@ -83,22 +81,30 @@ int main(int argc, const char *argv[])
     }
 
     // ── parse ─────────────────────────────────────────────────────────────────
-    std::ifstream stream;
-    stream.open(inputFile);
+    std::ifstream stream(inputFile);
     if (!stream.is_open())
     {
         std::cerr << "error: could not open file " << inputFile << "\n";
         return 1;
     }
 
-    ANTLRInputStream input(stream);
-    castLexer lexer(&input);
-    CommonTokenStream tokens(&lexer);
-    castParser parser(&tokens);
-    tree::ParseTree *tree = parser.startRule();
+    std::string sourceStr((std::istreambuf_iterator<char>(stream)),
+                          std::istreambuf_iterator<char>());
+
+    CastParser parser(sourceStr);
+    std::shared_ptr<ast::Program> program;
+    try
+    {
+        program = parser.parseProgram();
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Compilation failed: " << e.what() << "\n";
+        return 1;
+    }
 
     LowerVisitor visitor;
-    visitor.visit(tree);
+    visitor.visit(program);
 
     // ── lower to SV ───────────────────────────────────────────────────────────
     mlir::PassManager pm(visitor.topModule->getContext());

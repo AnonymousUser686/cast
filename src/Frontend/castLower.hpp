@@ -1,6 +1,4 @@
 #pragma once
-#include "antlr4-runtime.h"
-#include "castBaseVisitor.h"
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Location.h>
@@ -16,8 +14,13 @@
 #include <circt/Dialect/Seq/SeqDialect.h>
 #include <circt/Dialect/Seq/SeqOps.h>
 #include <circt/Dialect/Seq/SeqTypes.h>
+#include <unordered_map>
+#include <string>
+#include <any>
+#include <optional>
+#include "CastAST.hpp"
 
-class LowerVisitor : public castBaseVisitor
+class LowerVisitor
 {
 public:
     mlir::ModuleOp topModule;
@@ -36,36 +39,35 @@ public:
         this->currentClock = nullptr;
     }
 
-    std::any visitDecl_machine(castParser::Decl_machineContext *antlrCtx) override;
-    std::any visitDecl_states(castParser::Decl_statesContext *antlrCtx) override;
-    std::any visitDecl_state(castParser::Decl_stateContext *antlrCtx) override;
-    std::any visitDecl_interface(castParser::Decl_interfaceContext *antlrCtx) override;
-    std::any visitDecl_shared(castParser::Decl_sharedContext *antlrCtx) override;
-    std::any visitDecl_instantiate(castParser::Decl_instantiateContext *antlrCtx) override;
-    std::any visitInst_module(castParser::Inst_moduleContext *antlrCtx) override;
-    std::any visitIdent_field(castParser::Ident_fieldContext *antlrCtx) override;
-    std::any visitStmt_binary(castParser::Stmt_binaryContext *antlrCtx) override;
-    std::any visitAssignment_op(castParser::Assignment_opContext *antlrCtx) override;
-    std::any visitIdent(castParser::IdentContext *antlrCtx) override;
-    std::any visitType_lit(castParser::Type_litContext *antlrCtx) override;
-    std::any visitNumber_literal(castParser::Number_literalContext *antlrCtx) override;
-    std::any visitStmt(castParser::StmtContext *antlrCtx) override;
-    std::any visitExpr(castParser::ExprContext *antlrCtx) override;
-    std::any visitStmt_if(castParser::Stmt_ifContext *antlrCtx) override;
-    std::any visitStmt_nextstate(castParser::Stmt_nextstateContext *antlrCtx) override;
-    std::any visitExpr_func_call(castParser::Expr_func_callContext *antlrCtx) override;
-    std::any visitDecl_var(castParser::Decl_varContext *antlrCtx) override;
-    std::any visitDecl_enum(castParser::Decl_enumContext *antlrCtx) override;
-    std::any visitDecl_func(castParser::Decl_funcContext *antlrCtx) override;
-    std::any visitDecl_type(castParser::Decl_typeContext *antlrCtx) override;
-    std::any visitDecl_memory(castParser::Decl_memoryContext *antlrCtx) override;
-    std::any visitDecl_exception(castParser::Decl_exceptionContext *antlrCtx) override;
-    std::any visitDecl_assertions(castParser::Decl_assertionsContext *antlrCtx) override;
-    std::any visitStmt_for(castParser::Stmt_forContext *antlrCtx) override;
-    std::any visitStmt_switch(castParser::Stmt_switchContext *antlrCtx) override;
-    std::any visitStmt_return(castParser::Stmt_returnContext *antlrCtx) override;
+    std::any visit(ast::ASTNode *node);
+    std::any visit(const std::shared_ptr<ast::ASTNode> &node);
 
-    std::optional<mlir::Type> getMlirType(castParser::Ident_typedContext *typedIdentCtx);
+    std::any visitDecl_enum(ast::EnumDecl &decl);
+    std::any visitDecl_machine(ast::MachineDecl &decl);
+    std::any visitDecl_states(ast::StatesBlock &block);
+    std::any visitDecl_state(ast::StateDecl &decl);
+    std::any visitDecl_interface(ast::InterfaceBlock &block);
+    std::any visitDecl_shared(ast::SharedBlock &block);
+    std::any visitDecl_instantiate(ast::InstantiateDecl &decl);
+    std::any visitInst_module(ast::InstModuleStmt &stmt);
+    std::any visitIdent_field(ast::FieldExpr &expr);
+    std::any visitStmt_binary(ast::BinaryStmt &stmt);
+    std::any visitIdent(ast::IdentExpr &expr);
+    std::any visitNumber_literal(ast::NumberLiteral &expr);
+    std::any visitStmt(ast::Stmt &stmt);
+    std::any visitExpr(ast::Expr &expr);
+    std::any visitStmt_if(ast::IfStmt &stmt);
+    std::any visitStmt_nextstate(ast::GotoStmt &stmt);
+    std::any visitExpr_func_call(ast::CallExpr &expr);
+    std::any visitDecl_var(ast::VarDecl &decl);
+
+    // Unimplemented but parsed statements
+    std::any visitBlockStmt(ast::BlockStmt &stmt);
+    std::any visitForStmt(ast::ForStmt &stmt);
+    std::any visitSwitchStmt(ast::SwitchStmt &stmt);
+    std::any visitReturnStmt(ast::ReturnStmt &stmt);
+
+    std::optional<mlir::Type> getMlirType(const ast::Type &type);
 
 private:
     mlir::MLIRContext ctx;

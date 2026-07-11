@@ -19,56 +19,21 @@ list(APPEND CMAKE_MODULE_PATH "${CIRCT_INCLUDE_DIRS}")
 include(AddLLVM)
 include(AddMLIR)
 
-# cmake_print_variables(CIRCT_INCLUDE_DIRS)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 include_directories(SYSTEM ${CIRCT_INCLUDE_DIRS})
 
-set(GRAMMAR_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/Frontend/antlr/cast.g4)
-
-set(ANTLR_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
-
-set(ANTLR_EXECUTABLE "/Users/armv9/antlr/antlr-4.13.2-complete.jar")
-
-set(ANTLR_OUTPUTS
-    ${ANTLR_GEN_DIR}/castLexer.cpp
-    ${ANTLR_GEN_DIR}/castLexer.h
-    ${ANTLR_GEN_DIR}/castParser.cpp
-    ${ANTLR_GEN_DIR}/castParser.h
-    ${ANTLR_GEN_DIR}/castVisitor.cpp
-    ${ANTLR_GEN_DIR}/castVisitor.h
-    ${ANTLR_GEN_DIR}/castBaseVisitor.cpp
-    ${ANTLR_GEN_DIR}/castBaseVisitor.h
-)
-
-add_custom_command(
-    OUTPUT ${ANTLR_OUTPUTS}
-    COMMAND java -jar ${ANTLR_EXECUTABLE} -Dlanguage=Cpp -visitor -no-listener -o ${ANTLR_GEN_DIR} ${GRAMMAR_FILE}
-    DEPENDS ${GRAMMAR_FILE}
-    COMMENT "Generating ANTLR4 C++ sources for cast.g4"
-)
-
-find_library(ANTLR4_LIB 
-    NAMES libantlr4-runtime.a 
-    PATHS /usr/local/lib /opt/homebrew/lib
-)
-
-find_path(ANTLR4_INCLUDE_DIR antlr4-runtime PATHS /usr/local/include /opt/homebrew/include)
-include_directories(SYSTEM ${ANTLR4_INCLUDE_DIR}/antlr4-runtime)
-
 add_executable(castc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Frontend/parser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Frontend/castLower.cpp
-    ${ANTLR_OUTPUTS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Frontend/CastParser.cpp
 )
 
 target_include_directories(castc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${ANTLR_GEN_DIR}
 )
 
 target_link_libraries(castc
-    ${ANTLR4_LIB}
     CIRCTHW
     CIRCTSV
     CIRCTSeq
