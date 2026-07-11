@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 include(CMakePrintHelpers) # for debugging
 
 set(CMAKE_CXX_COMPILER "clang++")
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(CastCompiler VERSION 1.0 LANGUAGES CXX C)
 

@@ -18,6 +18,7 @@
 #include <string>
 #include <any>
 #include <optional>
+#include <map>
 #include "CastAST.hpp"
 
 class LowerVisitor
@@ -68,6 +69,7 @@ public:
     std::any visitReturnStmt(ast::ReturnStmt &stmt);
 
     std::optional<mlir::Type> getMlirType(const ast::Type &type);
+    std::optional<int64_t> evalConst(ast::Expr *expr, const std::map<std::string, int64_t> &consts);
 
 private:
     mlir::MLIRContext ctx;

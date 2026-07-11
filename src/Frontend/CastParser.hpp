@@ -83,6 +83,7 @@ private:
     std::shared_ptr<ast::ReturnStmt> parseReturnStmt();
     std::shared_ptr<ast::GotoStmt> parseGotoStmt();
     std::shared_ptr<ast::Stmt> parseVarDeclOrExprOrAssign();
+    std::shared_ptr<ast::Stmt> parseForUpdate();
     
     // Expressions
     std::shared_ptr<ast::Expr> parseExpr();

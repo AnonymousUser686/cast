@@ -1,0 +1,22 @@
+// Test compile-time bounded loop unrolling with print statements.
+
+machine TestLoop {
+    interface {}
+    shared {}
+    states {
+        init: {
+            print("Starting loop unrolling test:");
+            for (var uint16 i = 0; i < 5; i++) {
+                print("  Loop iteration i = ", i);
+            }
+            goto halt;
+        }
+        halt: {
+            goto halt;
+        }
+    }
+}
+
+instantiate {
+    tl = TestLoop();
+}

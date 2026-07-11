@@ -1,0 +1,88 @@
+// 2x2 Matrix Multiplication using compile-time bounded for loops.
+// Demonstrates how nested loops unroll and use compile-time loop variables to route assignments.
+
+machine MatrixMulLoops {
+    interface {}
+    shared {
+        // Matrix A (2x2)
+        var uint32 a00;
+        var uint32 a01;
+        var uint32 a10;
+        var uint32 a11;
+
+        // Matrix B (2x2)
+        var uint32 b00;
+        var uint32 b01;
+        var uint32 b10;
+        var uint32 b11;
+
+        // Matrix C (2x2) = A * B
+        var uint32 c00;
+        var uint32 c01;
+        var uint32 c10;
+        var uint32 c11;
+    }
+    states {
+        init: {
+            print("Initializing matrices A and B...");
+            
+            // Set Matrix A values:
+            // [ 1  2 ]
+            // [ 3  4 ]
+            a00 = 1;
+            a01 = 2;
+            a10 = 3;
+            a11 = 4;
+
+            // Set Matrix B values:
+            // [ 5  6 ]
+            // [ 7  8 ]
+            b00 = 5;
+            b01 = 6;
+            b10 = 7;
+            b11 = 8;
+
+            goto show_matrices;
+        }
+
+        show_matrices: {
+            print("Matrix A = [ ", a00, " ", a01, " ; ", a10, " ", a11, " ]   Matrix B = [ ", b00, " ", b01, " ; ", b10, " ", b11, " ]");
+            goto multiply;
+        }
+
+        multiply: {
+            print("Multiplying matrices using unrolled loops...");
+            for (var uint16 i = 0; i < 2; i++) {
+                for (var uint16 j = 0; j < 2; j++) {
+                    if (i == 0) {
+                        if (j == 0) {
+                            c00 = (a00 * b00) + (a01 * b10);
+                        } else if (j == 1) {
+                            c01 = (a00 * b01) + (a01 * b11);
+                        }
+                    } else if (i == 1) {
+                        if (j == 0) {
+                            c10 = (a10 * b00) + (a11 * b10);
+                        } else if (j == 1) {
+                            c11 = (a10 * b01) + (a11 * b11);
+                        }
+                    }
+                }
+            }
+            goto done;
+        }
+
+        done: {
+            print("Result C = A * B = [ ", c00, " ", c01, " ; ", c10, " ", c11, " ]");
+            goto halt;
+        }
+
+        halt: {
+            goto halt;
+        }
+    }
+}
+
+instantiate {
+    mm = MatrixMulLoops();
+}

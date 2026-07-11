@@ -699,14 +699,52 @@ std::shared_ptr<ast::GotoStmt> CastParser::parseGotoStmt() {
 std::shared_ptr<ast::ForStmt> CastParser::parseForStmt() {
     consume(); // for
     expect(TokenType::LPAREN, "expected '('");
-    int depth = 1;
-    while (depth > 0 && peekToken(0).type != TokenType::TOK_EOF) {
-        if (peekToken(0).type == TokenType::LPAREN) depth++;
-        else if (peekToken(0).type == TokenType::RPAREN) depth--;
-        consume();
-    }
+
     auto stmt = std::make_shared<ast::ForStmt>();
+
+    // 1. Parse init (optional)
+    if (peekToken(0).type != TokenType::SEMICOLON) {
+        stmt->init = parseStmt();
+    } else {
+        consume(); // consume ';'
+    }
+
+    // 2. Parse cond (optional)
+    if (peekToken(0).type != TokenType::SEMICOLON) {
+        stmt->cond = parseExpr();
+    }
+    expect(TokenType::SEMICOLON, "expected ';'");
+
+    // 3. Parse update (optional)
+    if (peekToken(0).type != TokenType::RPAREN) {
+        stmt->update = parseForUpdate();
+    }
+    expect(TokenType::RPAREN, "expected ')'");
+
+    // 4. Parse body
     stmt->body = parseBlockStmt();
+
+    return stmt;
+}
+
+std::shared_ptr<ast::Stmt> CastParser::parseForUpdate() {
+    auto lhs = parseExpr();
+    std::string op = peekToken(0).text;
+    if (match(TokenType::EQUAL) || match(TokenType::ARROW_L) || match(TokenType::ARROW_R) ||
+        match(TokenType::COLON_EQUAL) || match(TokenType::PLUS_EQUAL) || match(TokenType::MINUS_EQUAL) ||
+        match(TokenType::STAR_EQUAL) || match(TokenType::SLASH_EQUAL) || match(TokenType::XOR_EQUAL) ||
+        match(TokenType::SHL_EQUAL) || match(TokenType::SHR_EQUAL)) {
+        
+        auto rhs = parseExpr();
+        auto bin = std::make_shared<ast::BinaryStmt>();
+        bin->lhs = lhs;
+        bin->op = op;
+        bin->rhs = rhs;
+        return bin;
+    }
+    
+    auto stmt = std::make_shared<ast::ExprStmt>();
+    stmt->expr = lhs;
     return stmt;
 }
 
@@ -977,7 +1015,9 @@ std::shared_ptr<ast::Expr> CastParser::parsePrimaryExpr() {
         id->name = name;
         return id;
     }
-    throw std::runtime_error("Parser error: expected expression, got '" + peekToken(0).text + "'");
+    throw std::runtime_error("Parser error on line " + std::to_string(peekToken(0).line) +
+                             ", col " + std::to_string(peekToken(0).column) +
+                             ": expected expression, got '" + peekToken(0).text + "'");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
