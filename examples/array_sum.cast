@@ -36,6 +36,14 @@ machine ArraySum {
                 c[i] = a[i] + b[i];    // c[i] = 2i + 1
                 sum += c[i];           // accumulates the freshly written c[i]
             }
+            // NOTE: printing c[9]/sum here would show 0 — outside a loop, reads
+            // return the register's start-of-cycle value, and these writes do
+            // not commit until the cycle ends. Print in the next state instead.
+            goto report;
+        }
+
+        report: {
+            // c[9] and sum have now committed, so these read the new values.
             print("Finished sum: c[9] = ", c[9], ", total = ", sum);
             goto drain;
         }
