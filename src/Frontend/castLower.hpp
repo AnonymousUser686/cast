@@ -52,6 +52,7 @@ public:
     std::any visitDecl_instantiate(ast::InstantiateDecl &decl);
     std::any visitInst_module(ast::InstModuleStmt &stmt);
     std::any visitIdent_field(ast::FieldExpr &expr);
+    std::any visitIndexExpr(ast::IndexExpr &expr);
     std::any visitStmt_binary(ast::BinaryStmt &stmt);
     std::any visitIdent(ast::IdentExpr &expr);
     std::any visitNumber_literal(ast::NumberLiteral &expr);
@@ -89,6 +90,15 @@ private:
         std::unordered_map<std::string,
             std::pair<circt::seq::CompRegOp, circt::seq::CompRegOp>>> instanceFifoRegs;
     mlir::Value currentClock;
+
+    // Array storage: arrays lower to one register per element, stored in
+    // varRegs under mangled keys ("a[0]", "m[1][2]"). arrayInfo[mod][name]
+    // records the dimension sizes and element type of each declared array.
+    struct ArrayInfo {
+        std::vector<int64_t> dims;
+        mlir::Type elemType;
+    };
+    std::unordered_map<std::string, std::unordered_map<std::string, ArrayInfo>> arrayInfo;
 
     // Live mlir::Value bindings per module
     // varRegs[mod][name] : the CompRegOp backing a shared variable
@@ -130,10 +140,32 @@ private:
     // see the just-received data rather than the previous register value.
     std::unordered_map<std::string, mlir::Value> localBindings;
 
+    // Compile-time values of enclosing for-loop variables. Nested loops merge
+    // into this map so inner bounds/indices may reference outer loop vars.
+    std::map<std::string, int64_t> loopConstBindings;
+    // > 0 while lowering a for-loop body. Inside loops, readVar returns the
+    // pending (already-written-this-cycle) value so unrolled iterations see
+    // each other's writes; outside loops reads keep the language's
+    // registers-commit-at-cycle-end semantics.
+    int forLoopDepth = 0;
+
     bool insideInsantiate = false;
 
     // Helpers
     mlir::Value readVar(const std::string &name);
     void writeVar(const std::string &name, mlir::Value newVal, mlir::Value cond);
     mlir::Value coerce(mlir::Value v, mlir::Type t, mlir::Location loc);
+    mlir::Value applyCompound(const std::string &op, mlir::Value current,
+                              mlir::Value rhs, mlir::Location loc);
+    void declareArray(const std::string &name, const std::vector<int64_t> &dims,
+                      mlir::Type elemType);
+    // Resolved array access: element keys the access can hit, with the
+    // dynamic-index comparison condition for each (null when fully constant).
+    struct ArrayAccess {
+        std::vector<std::pair<std::string, mlir::Value>> elems;
+        mlir::Type elemType;
+    };
+    std::optional<ArrayAccess> resolveArrayAccess(ast::Expr *expr);
+    void writeArray(ast::Expr *lhs, const std::string &op, mlir::Value rhsVal,
+                    mlir::Value fire);
 };

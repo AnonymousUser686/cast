@@ -1,0 +1,72 @@
+// Arrays + for loops: element-wise sum of two 10-element arrays.
+//
+// Demonstrates:
+//  - array declaration (`var uint32 a[10];`) and constant/dynamic indexing
+//  - compile-time bounded for loops (fully unrolled into one cycle)
+//  - read-after-write inside loop bodies: `b[i] = a[i] + 1` sees the value
+//    just written to a[i] in the same cycle
+//  - a single-cycle reduction (`sum += c[i]`) across an unrolled loop
+//  - the goto pattern for runtime-bounded iteration (one element per cycle)
+
+machine ArraySum {
+    interface {}
+    shared {
+        var uint32 a[10];
+        var uint32 b[10];
+        var uint32 c[10];
+        var uint32 sum;
+        var uint8  idx;
+    }
+    states {
+        init: {
+            for (var int i = 0; i < 10; i++) {
+                a[i] = i;
+                b[i] = a[i] + 1;   // reads the a[i] written above: b[i] = i + 1
+                c[i] = 0;
+            }
+            print("Done init");
+            goto compute;
+        }
+
+        compute: {
+            // Compile-time bound: unrolls into 10 parallel adds plus a
+            // reduction tree, all in this single cycle.
+            sum = 0;
+            for (var int i = 0; i < 10; i++) {
+                c[i] = a[i] + b[i];    // c[i] = 2i + 1
+                sum += c[i];           // accumulates the freshly written c[i]
+            }
+            // NOTE: printing c[9]/sum here would show 0 — outside a loop, reads
+            // return the register's start-of-cycle value, and these writes do
+            // not commit until the cycle ends. Print in the next state instead.
+            goto report;
+        }
+
+        report: {
+            // c[9] and sum have now committed, so these read the new values.
+            print("Finished sum: c[9] = ", c[9], ", total = ", sum);
+            goto drain;
+        }
+
+        drain: {
+            // Runtime-bounded loop: `idx` is a register, so this cannot
+            // unroll. Instead the state re-enters itself once per cycle.
+            // c[idx] is a dynamic index and lowers to a mux over c.
+            if (idx < 10) {
+                print("c[", idx, "] = ", c[idx]);
+                idx++;
+                goto drain;
+            } else {
+                goto halt;
+            }
+        }
+
+        halt: {
+            goto halt;
+        }
+    }
+}
+
+instantiate {
+    s = ArraySum();
+}

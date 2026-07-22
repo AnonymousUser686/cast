@@ -33,3 +33,7 @@ ehthumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Locally-built helper tool binaries (build from tools/*.cpp as needed)
+tools/*.exe
+tools/cast_sim

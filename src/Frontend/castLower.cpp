@@ -90,6 +90,8 @@ std::any LowerVisitor::visit(ast::ASTNode *node) {
     return visitIdent(*static_cast<ast::IdentExpr *>(node));
   case ast::ASTNodeKind::FieldExpr:
     return visitIdent_field(*static_cast<ast::FieldExpr *>(node));
+  case ast::ASTNodeKind::IndexExpr:
+    return visitIndexExpr(*static_cast<ast::IndexExpr *>(node));
   case ast::ASTNodeKind::NumberLiteral:
     return visitNumber_literal(*static_cast<ast::NumberLiteral *>(node));
   case ast::ASTNodeKind::StringLiteral:
@@ -156,6 +158,16 @@ mlir::Value LowerVisitor::readVar(const std::string &name) {
   auto it = mvars.find(name);
   if (it == mvars.end())
     return nullptr;
+  // Inside an unrolled for-loop body, reads observe writes made earlier in
+  // the same cycle (software order), so accumulations like `sum += a[i]`
+  // work when unrolled. Outside loops, reads keep the documented semantics:
+  // they return the pre-update register value.
+  if (this->forLoopDepth > 0) {
+    auto &mnext = this->varNext[this->currentModuleName];
+    auto nIt = mnext.find(name);
+    if (nIt != mnext.end() && nIt->second)
+      return nIt->second;
+  }
   return it->second.getResult();
 }
 
@@ -171,6 +183,246 @@ void LowerVisitor::writeVar(const std::string &name, mlir::Value newVal,
   mlir::Value next =
       circt::comb::MuxOp::create(builder, loc, cond, coerced, prev);
   this->varNext[this->currentModuleName][name] = next;
+}
+
+// Shared implementation of the compound-assignment operators for both scalar
+// variables and array elements. `current` is the present value of the target;
+// returns the value to store.
+mlir::Value LowerVisitor::applyCompound(const std::string &op,
+                                        mlir::Value current, mlir::Value rhs,
+                                        mlir::Location loc) {
+  if (op == "=" || op == ":=")
+    return rhs;
+  mlir::Value r = coerce(rhs, current.getType(), loc);
+  if (op == "+=")
+    return circt::comb::AddOp::create(builder, loc, current, r);
+  if (op == "-=")
+    return circt::comb::SubOp::create(builder, loc, current, r);
+  if (op == "*=")
+    return circt::comb::MulOp::create(builder, loc, current, r);
+  if (op == "/=")
+    return circt::comb::DivUOp::create(builder, loc, current, r);
+  if (op == "^=")
+    return circt::comb::XorOp::create(builder, loc, current, r);
+  if (op == "<<=")
+    return circt::comb::ShlOp::create(builder, loc, current, r);
+  if (op == ">>=")
+    return circt::comb::ShrUOp::create(builder, loc, current, r);
+  return rhs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Arrays
+//
+// An `[N]T` array lowers to N element registers (a register file). Constant
+// indices resolve to a single element at compile time; dynamic indices build
+// a mux tree on reads and per-element write-enable conditions on writes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Peels a[i][j] → ("a", {i, j}). Returns false when the base is not a plain
+// identifier.
+static bool peelIndexChain(ast::Expr *expr, std::string &name,
+                           std::vector<ast::Expr *> &indices) {
+  while (expr && expr->getKind() == ast::ASTNodeKind::IndexExpr) {
+    auto *ix = static_cast<ast::IndexExpr *>(expr);
+    indices.insert(indices.begin(), ix->index.get());
+    expr = ix->base.get();
+  }
+  if (expr && expr->getKind() == ast::ASTNodeKind::IdentExpr) {
+    name = static_cast<ast::IdentExpr *>(expr)->name;
+    return true;
+  }
+  return false;
+}
+
+static std::string elemKey(const std::string &name,
+                           const std::vector<int64_t> &idx) {
+  std::string key = name;
+  for (int64_t i : idx)
+    key += "[" + std::to_string(i) + "]";
+  return key;
+}
+
+void LowerVisitor::declareArray(const std::string &name,
+                                const std::vector<int64_t> &dims,
+                                mlir::Type elemType) {
+  mlir::Location loc = builder.getUnknownLoc();
+  int64_t total = 1;
+  for (int64_t d : dims)
+    total *= d;
+  if (total > 65536) {
+    std::cerr << "Error: array '" << name << "' has " << total
+              << " elements; the register-per-element lowering supports at "
+                 "most 65536.\n";
+    exit(1);
+  }
+
+  this->arrayInfo[this->currentModuleName][name] = {dims, elemType};
+
+  std::vector<int64_t> idx(dims.size(), 0);
+  for (int64_t flat = 0; flat < total; ++flat) {
+    std::string key = elemKey(name, idx);
+    this->variables[this->currentModuleName][key] = elemType;
+    mlir::Value zero = circt::hw::ConstantOp::create(builder, loc, elemType, 0);
+    circt::seq::CompRegOp reg = circt::seq::CompRegOp::create(
+        builder, loc, zero, this->currentClock, this->currentReset, zero);
+    this->varRegs[this->currentModuleName][key] = reg;
+    this->varNext[this->currentModuleName][key] = reg.getResult();
+    // Advance the multi-dimensional index (odometer order, last dim fastest).
+    for (int d = (int)dims.size() - 1; d >= 0; --d) {
+      if (++idx[d] < dims[d])
+        break;
+      idx[d] = 0;
+    }
+  }
+}
+
+std::optional<LowerVisitor::ArrayAccess>
+LowerVisitor::resolveArrayAccess(ast::Expr *expr) {
+  std::string name;
+  std::vector<ast::Expr *> indices;
+  if (!peelIndexChain(expr, name, indices))
+    return std::nullopt;
+
+  auto &arrays = this->arrayInfo[this->currentModuleName];
+  auto arrIt = arrays.find(name);
+  if (arrIt == arrays.end()) {
+    std::cerr << "Error: '" << name
+              << "' is indexed with [] but is not a declared array.\n";
+    exit(1);
+  }
+  const ArrayInfo &info = arrIt->second;
+  const std::vector<int64_t> &dims = info.dims;
+  if (indices.size() != dims.size()) {
+    std::cerr << "Error: array '" << name << "' has " << dims.size()
+              << " dimension(s) but is accessed with " << indices.size()
+              << " index/indices.\n";
+    exit(1);
+  }
+
+  mlir::Location loc = builder.getUnknownLoc();
+
+  // Resolve each index: compile-time constant when possible, otherwise a
+  // hardware value to compare against at runtime.
+  std::vector<std::optional<int64_t>> constIdx(dims.size());
+  std::vector<mlir::Value> dynIdx(dims.size());
+  for (size_t d = 0; d < dims.size(); ++d) {
+    auto c = evalConst(indices[d], this->loopConstBindings);
+    if (c) {
+      if (*c < 0 || *c >= dims[d]) {
+        std::cerr << "Error: index " << *c << " is out of bounds for array '"
+                  << name << "' dimension " << d << " (size " << dims[d]
+                  << ").\n";
+        exit(1);
+      }
+      constIdx[d] = *c;
+      continue;
+    }
+    auto any = visit(indices[d]);
+    if (!any.has_value() || any.type() != typeid(mlir::Value)) {
+      std::cerr << "Error: cannot evaluate index expression for array '"
+                << name << "'.\n";
+      exit(1);
+    }
+    mlir::Value v = std::any_cast<mlir::Value>(any);
+    if (!v || !mlir::isa<mlir::IntegerType>(v.getType())) {
+      std::cerr << "Error: index expression for array '" << name
+                << "' is not an integer value.\n";
+      exit(1);
+    }
+    dynIdx[d] = v;
+  }
+
+  // Enumerate the elements this access can reach. Constant dimensions pin
+  // their coordinate; dynamic dimensions contribute an equality comparison.
+  ArrayAccess access;
+  access.elemType = info.elemType;
+  int64_t total = 1;
+  for (int64_t d : dims)
+    total *= d;
+  std::vector<int64_t> idx(dims.size(), 0);
+  for (int64_t flat = 0; flat < total; ++flat) {
+    bool reachable = true;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      if (constIdx[d] && *constIdx[d] != idx[d]) {
+        reachable = false;
+        break;
+      }
+      if (dynIdx[d]) {
+        unsigned w =
+            mlir::cast<mlir::IntegerType>(dynIdx[d].getType()).getWidth();
+        // Coordinates the index register cannot even represent are dead.
+        if (w < 64 && idx[d] >= (int64_t{1} << w)) {
+          reachable = false;
+          break;
+        }
+      }
+    }
+    if (reachable) {
+      mlir::Value cond; // null = unconditional (all dims constant)
+      for (size_t d = 0; d < dims.size(); ++d) {
+        if (!dynIdx[d])
+          continue;
+        mlir::Value coord = circt::hw::ConstantOp::create(
+            builder, loc, dynIdx[d].getType(), idx[d]);
+        mlir::Value eq = circt::comb::ICmpOp::create(
+            builder, loc, circt::comb::ICmpPredicate::eq, dynIdx[d], coord);
+        cond = cond ? mlir::Value(
+                          circt::comb::AndOp::create(builder, loc, cond, eq))
+                    : eq;
+      }
+      access.elems.push_back({elemKey(name, idx), cond});
+    }
+    for (int d = (int)dims.size() - 1; d >= 0; --d) {
+      if (++idx[d] < dims[d])
+        break;
+      idx[d] = 0;
+    }
+  }
+  return access;
+}
+
+std::any LowerVisitor::visitIndexExpr(ast::IndexExpr &expr) {
+  auto access = resolveArrayAccess(&expr);
+  if (!access)
+    return std::any();
+  mlir::Location loc = builder.getUnknownLoc();
+
+  // Fully constant access → read the one element directly.
+  if (access->elems.size() == 1 && !access->elems[0].second)
+    return mlir::Value(readVar(access->elems[0].first));
+
+  // Dynamic access → mux tree over every reachable element. An out-of-range
+  // index value reads as 0.
+  mlir::Value result =
+      circt::hw::ConstantOp::create(builder, loc, access->elemType, 0);
+  for (auto &[key, cond] : access->elems) {
+    mlir::Value elemVal = readVar(key);
+    if (!elemVal)
+      continue;
+    result = cond ? mlir::Value(circt::comb::MuxOp::create(builder, loc, cond,
+                                                           elemVal, result))
+                  : elemVal;
+  }
+  return result;
+}
+
+void LowerVisitor::writeArray(ast::Expr *lhs, const std::string &op,
+                              mlir::Value rhsVal, mlir::Value fire) {
+  auto access = resolveArrayAccess(lhs);
+  if (!access)
+    return;
+  mlir::Location loc = builder.getUnknownLoc();
+  for (auto &[key, cond] : access->elems) {
+    mlir::Value enable =
+        cond ? mlir::Value(circt::comb::AndOp::create(builder, loc, fire, cond))
+             : fire;
+    mlir::Value current = readVar(key);
+    if (!current)
+      continue;
+    mlir::Value newVal = applyCompound(op, current, rhsVal, loc);
+    writeVar(key, newVal, enable);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,6 +451,7 @@ std::any LowerVisitor::visitDecl_machine(ast::MachineDecl &decl) {
   this->portDirs[moduleName];
   this->varRegs[moduleName];
   this->varNext[moduleName];
+  this->arrayInfo[moduleName];
   this->stateIds[moduleName];
   this->stateActive[moduleName];
   this->outputDataNext[moduleName];
@@ -311,16 +564,54 @@ std::any LowerVisitor::visitDecl_interface(ast::InterfaceBlock &block) {
 std::any LowerVisitor::visitDecl_shared(ast::SharedBlock &block) {
   mlir::Location loc = builder.getUnknownLoc();
   for (auto &v : block.varDecls) {
+    // Array declaration: peel [N] layers to the element type, then create
+    // one register per element.
+    if (v->typedIdent.type.kind == ast::TypeKind::ARRAY) {
+      std::vector<int64_t> dims;
+      const ast::Type *t = &v->typedIdent.type;
+      while (t->kind == ast::TypeKind::ARRAY && t->elementType) {
+        dims.push_back(t->size);
+        t = t->elementType.get();
+      }
+      auto elemType = getMlirType(*t);
+      if (!elemType) {
+        std::cerr << "Error: array element type '" << t->name
+                  << "' is not supported.\n";
+        exit(1);
+      }
+      if (v->initExpr) {
+        std::cerr << "Error: array initializers are not supported; assign "
+                     "elements in a state instead.\n";
+        exit(1);
+      }
+      for (auto &id : v->typedIdent.idents)
+        declareArray(id, dims, elemType.value());
+      continue;
+    }
+
     auto maybeType = getMlirType(v->typedIdent.type);
     if (!maybeType)
       continue;
+
+    // A constant initializer becomes the register's reset value.
+    int64_t initVal = 0;
+    if (v->initExpr) {
+      auto c = evalConst(v->initExpr.get(), {});
+      if (!c) {
+        std::cerr << "Error: shared variable initializer must be a "
+                     "compile-time constant.\n";
+        exit(1);
+      }
+      initVal = *c;
+    }
+
     for (auto &id : v->typedIdent.idents) {
       std::string name = id;
       this->variables[this->currentModuleName][name] = maybeType.value();
-      mlir::Value zero =
-          circt::hw::ConstantOp::create(builder, loc, maybeType.value(), 0);
+      mlir::Value init = circt::hw::ConstantOp::create(
+          builder, loc, maybeType.value(), initVal);
       circt::seq::CompRegOp reg = circt::seq::CompRegOp::create(
-          builder, loc, zero, this->currentClock, this->currentReset, zero);
+          builder, loc, init, this->currentClock, this->currentReset, init);
       this->varRegs[this->currentModuleName][name] = reg;
       this->varNext[this->currentModuleName][name] = reg.getResult();
     }
@@ -481,8 +772,14 @@ std::optional<mlir::Type> LowerVisitor::getMlirType(const ast::Type &t) {
       return builder.getI32Type();
     if (t.name == "byte")
       return builder.getI8Type();
+    if (t.name == "int8" || t.name == "uint8")
+      return builder.getI8Type();
+    if (t.name == "int16")
+      return builder.getIntegerType(16);
     if (t.name == "int32")
       return builder.getI32Type();
+    if (t.name == "int64" || t.name == "uint64")
+      return builder.getIntegerType(64);
     if (t.name == "uint32")
       return builder.getIntegerType(32);
     if (t.name == "uint16")
@@ -501,8 +798,7 @@ std::any LowerVisitor::visitIdent(ast::IdentExpr &expr) {
     return mlir::Value(this->localBindings[name]);
   if (this->varRegs.count(this->currentModuleName) &&
       this->varRegs[this->currentModuleName].count(name))
-    return mlir::Value(
-        this->varRegs[this->currentModuleName][name].getResult());
+    return mlir::Value(readVar(name));
   if (this->portValues.count(this->currentModuleName) &&
       this->portValues[this->currentModuleName].count(name))
     return this->portValues[this->currentModuleName][name];
@@ -531,6 +827,8 @@ std::any LowerVisitor::visitExpr(ast::Expr &expr) {
     return visitIdent(static_cast<ast::IdentExpr &>(expr));
   if (expr.getKind() == ast::ASTNodeKind::FieldExpr)
     return visitIdent_field(static_cast<ast::FieldExpr &>(expr));
+  if (expr.getKind() == ast::ASTNodeKind::IndexExpr)
+    return visitIndexExpr(static_cast<ast::IndexExpr &>(expr));
   if (expr.getKind() == ast::ASTNodeKind::NumberLiteral)
     return visitNumber_literal(static_cast<ast::NumberLiteral &>(expr));
   if (expr.getKind() == ast::ASTNodeKind::StringLiteral)
@@ -550,6 +848,11 @@ std::any LowerVisitor::visitExpr(ast::Expr &expr) {
       mlir::Value one =
           circt::hw::ConstantOp::create(builder, loc, v.getType(), 1);
       return mlir::Value(circt::comb::XorOp::create(builder, loc, v, one));
+    }
+    if (un.op == "-") {
+      mlir::Value zero =
+          circt::hw::ConstantOp::create(builder, loc, v.getType(), 0);
+      return mlir::Value(circt::comb::SubOp::create(builder, loc, zero, v));
     }
     notImplemented("unary operator '" + un.op + "'");
   }
@@ -642,6 +945,15 @@ std::any LowerVisitor::visitExpr(ast::Expr &expr) {
                 : mlir::Value(circt::comb::AddOp::create(builder, loc, v, one));
         writeVar(nm, updated, this->currentFire);
       }
+    } else if (upd.expr->getKind() == ast::ASTNodeKind::IndexExpr &&
+               this->currentFire) {
+      mlir::Value one =
+          circt::hw::ConstantOp::create(builder, loc, v.getType(), 1);
+      mlir::Value updated =
+          (upd.op == "--")
+              ? mlir::Value(circt::comb::SubOp::create(builder, loc, v, one))
+              : mlir::Value(circt::comb::AddOp::create(builder, loc, v, one));
+      writeArray(upd.expr.get(), "=", updated, this->currentFire);
     }
     return v;
   }
@@ -650,6 +962,30 @@ std::any LowerVisitor::visitExpr(ast::Expr &expr) {
 }
 
 std::any LowerVisitor::visitDecl_var(ast::VarDecl &decl) {
+  if (decl.typedIdent.type.kind == ast::TypeKind::ARRAY) {
+    std::vector<int64_t> dims;
+    const ast::Type *t = &decl.typedIdent.type;
+    while (t->kind == ast::TypeKind::ARRAY && t->elementType) {
+      dims.push_back(t->size);
+      t = t->elementType.get();
+    }
+    auto elemType = getMlirType(*t);
+    if (!elemType) {
+      std::cerr << "Error: array element type '" << t->name
+                << "' is not supported.\n";
+      exit(1);
+    }
+    if (decl.initExpr) {
+      std::cerr << "Error: array initializers are not supported; assign "
+                   "elements individually instead.\n";
+      exit(1);
+    }
+    for (auto &id : decl.typedIdent.idents)
+      if (!this->arrayInfo[this->currentModuleName].count(id))
+        declareArray(id, dims, elemType.value());
+    return std::any();
+  }
+
   auto maybeType = getMlirType(decl.typedIdent.type);
   if (!maybeType)
     return std::any();
@@ -734,14 +1070,24 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
 
   std::string lhsName;
   bool lhsIsVar = false;
+  bool lhsIsArrayElem = false;
   if (lhsExpr->getKind() == ast::ASTNodeKind::IdentExpr) {
     lhsName = static_cast<ast::IdentExpr *>(lhsExpr.get())->name;
     lhsIsVar = true;
+  } else if (lhsExpr->getKind() == ast::ASTNodeKind::IndexExpr) {
+    lhsIsArrayElem = true;
   }
 
   mlir::Type hint;
   if (lhsIsVar && this->variables[this->currentModuleName].count(lhsName))
     hint = this->variables[this->currentModuleName][lhsName];
+  if (lhsIsArrayElem) {
+    std::string arrName;
+    std::vector<ast::Expr *> arrIndices;
+    if (peelIndexChain(lhsExpr.get(), arrName, arrIndices) &&
+        this->arrayInfo[this->currentModuleName].count(arrName))
+      hint = this->arrayInfo[this->currentModuleName][arrName].elemType;
+  }
   mlir::Type prevHint = this->currentExprType;
   this->currentExprType = hint;
   auto rhsAny = visit(rhsExpr);
@@ -762,7 +1108,7 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
 
     std::string dstName;
     std::string dstInst, dstPort;
-    bool dstIsIdent = false, dstIsField = false;
+    bool dstIsIdent = false, dstIsField = false, dstIsArrayElem = false;
     if (dstExpr->getKind() == ast::ASTNodeKind::IdentExpr) {
       dstName = static_cast<ast::IdentExpr *>(dstExpr.get())->name;
       dstIsIdent = true;
@@ -770,6 +1116,8 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
       dstInst = static_cast<ast::FieldExpr *>(dstExpr.get())->object;
       dstPort = static_cast<ast::FieldExpr *>(dstExpr.get())->field;
       dstIsField = true;
+    } else if (dstExpr->getKind() == ast::ASTNodeKind::IndexExpr) {
+      dstIsArrayElem = true;
     }
 
     auto srcAny = visit(srcExpr);
@@ -805,6 +1153,10 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
             this->currentFire = cond;
             this->localBindings[dstName] = data;
           }
+        } else if (dstIsArrayElem) {
+          writeArray(dstExpr.get(), "=", data, cond);
+          if (this->inStateHeader)
+            this->currentFire = cond;
         }
         return std::any();
       }
@@ -865,36 +1217,15 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
     return std::any();
   }
 
+  if (lhsIsArrayElem && rhsVal) {
+    writeArray(lhsExpr.get(), op, rhsVal, fire);
+    return std::any();
+  }
+
   if (lhsIsVar && this->varRegs[this->currentModuleName].count(lhsName) &&
       rhsVal) {
     mlir::Value current = readVar(lhsName);
-    mlir::Value newVal;
-    if (op == "=" || op == ":=") {
-      newVal = rhsVal;
-    } else if (op == "+=") {
-      newVal = circt::comb::AddOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == "-=") {
-      newVal = circt::comb::SubOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == "*=") {
-      newVal = circt::comb::MulOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == "/=") {
-      newVal = circt::comb::DivUOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == "^=") {
-      newVal = circt::comb::XorOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == "<<=") {
-      newVal = circt::comb::ShlOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else if (op == ">>=") {
-      newVal = circt::comb::ShrUOp::create(
-          builder, loc, current, coerce(rhsVal, current.getType(), loc));
-    } else {
-      newVal = rhsVal;
-    }
+    mlir::Value newVal = applyCompound(op, current, rhsVal, loc);
     writeVar(lhsName, newVal, fire);
     return std::any();
   }
@@ -1073,6 +1404,11 @@ std::optional<int64_t> LowerVisitor::evalConst(ast::Expr *expr, const std::map<s
       if (op == "*") return *l * *r;
       if (op == "/") return *r != 0 ? std::optional<int64_t>(*l / *r) : std::nullopt;
       if (op == "%") return *r != 0 ? std::optional<int64_t>(*l % *r) : std::nullopt;
+      if (op == "<<") return *l << *r;
+      if (op == ">>") return *l >> *r;
+      if (op == "&") return *l & *r;
+      if (op == "|") return *l | *r;
+      if (op == "^") return *l ^ *r;
       if (op == "<") return *l < *r;
       if (op == "<=") return *l <= *r;
       if (op == ">") return *l > *r;
@@ -1100,14 +1436,20 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
   std::string loopVar;
   int64_t initVal = 0;
   bool hasInit = false;
+  mlir::Type loopVarType = builder.getI32Type();
 
+  // The init expression may reference enclosing loop variables
+  // (e.g. `for (var int j = i; ...)` inside an outer loop over i).
   if (stmt.init) {
     if (stmt.init->getKind() == ast::ASTNodeKind::VarDeclStmt) {
       auto vd = static_cast<ast::VarDeclStmt*>(stmt.init.get())->varDecl;
       if (vd && !vd->typedIdent.idents.empty()) {
         loopVar = vd->typedIdent.idents[0];
+        if (auto t = getMlirType(vd->typedIdent.type))
+          if (mlir::isa<mlir::IntegerType>(*t))
+            loopVarType = *t;
         if (vd->initExpr) {
-          auto v = evalConst(vd->initExpr.get(), {});
+          auto v = evalConst(vd->initExpr.get(), this->loopConstBindings);
           if (v) {
             initVal = *v;
             hasInit = true;
@@ -1118,7 +1460,12 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
       auto bs = static_cast<ast::BinaryStmt*>(stmt.init.get());
       if (bs->op == "=" && bs->lhs->getKind() == ast::ASTNodeKind::IdentExpr) {
         loopVar = static_cast<ast::IdentExpr*>(bs->lhs.get())->name;
-        auto v = evalConst(bs->rhs.get(), {});
+        if (this->variables[this->currentModuleName].count(loopVar)) {
+          mlir::Type t = this->variables[this->currentModuleName][loopVar];
+          if (mlir::isa<mlir::IntegerType>(t))
+            loopVarType = t;
+        }
+        auto v = evalConst(bs->rhs.get(), this->loopConstBindings);
         if (v) {
           initVal = *v;
           hasInit = true;
@@ -1132,16 +1479,18 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
     exit(1);
   }
 
-  std::map<std::string, int64_t> loopConsts;
-  loopConsts[loopVar] = initVal;
-
+  // Save any outer binding of the same name (loop-variable shadowing).
   mlir::Value oldVal;
   bool hadOldVal = this->localBindings.count(loopVar);
   if (hadOldVal) oldVal = this->localBindings[loopVar];
+  bool hadOldConst = this->loopConstBindings.count(loopVar);
+  int64_t oldConst = hadOldConst ? this->loopConstBindings[loopVar] : 0;
 
   int64_t currVal = initVal;
   const int maxIterations = 100000; // Safeguard against infinite unrolling loops
   int iterations = 0;
+
+  this->forLoopDepth++;
 
   while (true) {
     if (iterations >= maxIterations) {
@@ -1149,13 +1498,16 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
       exit(1);
     }
 
-    loopConsts[loopVar] = currVal;
-    
+    this->loopConstBindings[loopVar] = currVal;
+
     // Evaluate condition
     if (stmt.cond) {
-      auto condVal = evalConst(stmt.cond.get(), loopConsts);
+      auto condVal = evalConst(stmt.cond.get(), this->loopConstBindings);
       if (!condVal) {
-        std::cerr << "Error: for loop condition must evaluate to a compile-time constant.\n";
+        std::cerr << "Error: for loop bound must be a compile-time constant "
+                     "(a literal or an enclosing loop variable). For a "
+                     "runtime bound, use a state that increments a shared "
+                     "variable and loops with goto.\n";
         exit(1);
       }
       if (*condVal == 0) {
@@ -1169,7 +1521,7 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
 
     // Set loop variable inside MLIR lowering environment as a constant
     mlir::Value currValVal = circt::hw::ConstantOp::create(
-        builder, loc, builder.getI32Type(), currVal);
+        builder, loc, loopVarType, currVal);
     this->localBindings[loopVar] = currValVal;
 
     // Lower the body
@@ -1202,10 +1554,31 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
         if (bs->lhs->getKind() == ast::ASTNodeKind::IdentExpr) {
           std::string name = static_cast<ast::IdentExpr*>(bs->lhs.get())->name;
           if (name == loopVar) {
-            auto nextVal = evalConst(bs->rhs.get(), loopConsts);
-            if (nextVal) {
-              currVal = *nextVal;
-              hasUpdate = true;
+            auto rhsVal = evalConst(bs->rhs.get(), this->loopConstBindings);
+            if (rhsVal) {
+              const std::string &uop = bs->op;
+              if (uop == "=" || uop == ":=") {
+                currVal = *rhsVal;
+                hasUpdate = true;
+              } else if (uop == "+=") {
+                currVal += *rhsVal;
+                hasUpdate = true;
+              } else if (uop == "-=") {
+                currVal -= *rhsVal;
+                hasUpdate = true;
+              } else if (uop == "*=") {
+                currVal *= *rhsVal;
+                hasUpdate = true;
+              } else if (uop == "/=" && *rhsVal != 0) {
+                currVal /= *rhsVal;
+                hasUpdate = true;
+              } else if (uop == "<<=") {
+                currVal <<= *rhsVal;
+                hasUpdate = true;
+              } else if (uop == ">>=") {
+                currVal >>= *rhsVal;
+                hasUpdate = true;
+              }
             }
           }
         }
@@ -1220,11 +1593,29 @@ std::any LowerVisitor::visitForStmt(ast::ForStmt &stmt) {
     iterations++;
   }
 
+  this->forLoopDepth--;
+
   // Restore the loop variable in the outer scope
   if (hadOldVal) {
     this->localBindings[loopVar] = oldVal;
   } else {
     this->localBindings.erase(loopVar);
+  }
+  if (hadOldConst) {
+    this->loopConstBindings[loopVar] = oldConst;
+  } else {
+    this->loopConstBindings.erase(loopVar);
+  }
+
+  // When the loop variable names a shared register (`for (i = 0; ...)` with
+  // shared i), commit the final value so code after the loop sees it.
+  if (this->varRegs[this->currentModuleName].count(loopVar) &&
+      this->currentFire) {
+    mlir::Type regTy =
+        this->varRegs[this->currentModuleName][loopVar].getResult().getType();
+    mlir::Value finalVal =
+        circt::hw::ConstantOp::create(builder, loc, regTy, currVal);
+    writeVar(loopVar, finalVal, this->currentFire);
   }
 
   return std::any();

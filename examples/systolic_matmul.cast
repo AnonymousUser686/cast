@@ -1,0 +1,115 @@
+// 3x3 output-stationary systolic array for matrix multiplication.
+//
+// Layout: a 3x3 grid of processing elements (PEs). PE(i,j) owns:
+//   a_pipe[i][j] — its A operand register (values flow left -> right)
+//   b_pipe[i][j] — its B operand register (values flow top -> bottom)
+//   c[i][j]      — its accumulator (stationary)
+//
+// Every `step` cycle each PE multiplies its current operand pair into its
+// accumulator, then all operands shift one PE right/down. Row i of A enters
+// the left edge skewed by i cycles; column j of B enters the top edge skewed
+// by j cycles. The skews align so PE(i,j) sees a[i][k] and b[k][j] together
+// on cycle t = i + j + k + 1. After 8 step cycles (t = 0..7) every product
+// has been accumulated and C = A * B.
+//
+// Semantics notes (see readme "for" and "Arrays"):
+//  - Loop bounds are compile-time constants, so the loops fully unroll into
+//    the single-cycle `step` body: all 9 MACs happen in parallel every cycle.
+//  - Inside for-loop bodies, reads see values written earlier in the same
+//    cycle. The shift loops therefore iterate high -> low index so each PE
+//    reads its neighbour's pre-shift value (like a software array shift).
+//  - a[i][t - i] with runtime t is a dynamic index: it lowers to a mux over
+//    row i, and reads 0 when t - i is out of range.
+
+machine SystolicMatmul {
+    interface {}
+    shared {
+        // Operand matrices, loaded once at start.
+        var uint32 a[3][3];
+        var uint32 b[3][3];
+        // Per-PE registers.
+        var uint32 a_pipe[3][3];
+        var uint32 b_pipe[3][3];
+        var uint32 c[3][3];
+        // Systolic cycle counter.
+        var uint32 t;
+    }
+    states {
+        load: {
+            // A = [ 1 2 3 ; 4 5 6 ; 7 8 9 ]   B = [ 1 2 3 ; 2 4 6 ; 3 6 9 ]
+            for (var int i = 0; i < 3; i++) {
+                for (var int j = 0; j < 3; j++) {
+                    a[i][j] = i * 3 + j + 1;
+                    b[i][j] = (i + 1) * (j + 1);
+                }
+            }
+            print("[load] A = [ 1 2 3 ; 4 5 6 ; 7 8 9 ]");
+            print("[load] B = [ 1 2 3 ; 2 4 6 ; 3 6 9 ]");
+            goto step;
+        }
+
+        step: {
+            // 1. MAC phase: every PE accumulates its current operand pair.
+            //    (Pipes were last written in the previous cycle.)
+            for (var int i = 0; i < 3; i++) {
+                for (var int j = 0; j < 3; j++) {
+                    c[i][j] += a_pipe[i][j] * b_pipe[i][j];
+                }
+            }
+
+            // 2. Shift phase: A values move right. Iterate j high -> low so
+            //    each PE reads its left neighbour's pre-shift value.
+            for (var int i = 0; i < 3; i++) {
+                for (var int j = 2; j > 0; j--) {
+                    a_pipe[i][j] = a_pipe[i][j - 1];
+                }
+                // Left-edge feeder: row i receives a[i][t - i], skewed by i.
+                if (t >= i && t < i + 3) {
+                    a_pipe[i][0] = a[i][t - i];
+                } else {
+                    a_pipe[i][0] = 0;
+                }
+            }
+
+            // 3. Shift phase: B values move down. Iterate i high -> low.
+            for (var int j = 0; j < 3; j++) {
+                for (var int i = 2; i > 0; i--) {
+                    b_pipe[i][j] = b_pipe[i - 1][j];
+                }
+                // Top-edge feeder: column j receives b[t - j][j], skewed by j.
+                if (t >= j && t < j + 3) {
+                    b_pipe[0][j] = b[t - j][j];
+                } else {
+                    b_pipe[0][j] = 0;
+                }
+            }
+
+            print("[step] t = ", t);
+            t++;
+            // Reads outside loops see the pre-update value, so this compares
+            // the t this cycle started with. Last useful MAC is at t = 7.
+            if (t < 7) {
+                goto step;
+            } else {
+                goto done;
+            }
+        }
+
+        done: {
+            print("C = A * B:");
+            for (var int i = 0; i < 3; i++) {
+                print("  [ ", c[i][0], " ", c[i][1], " ", c[i][2], " ]");
+            }
+            // Expected: [ 14 28 42 ; 32 64 96 ; 50 100 150 ]
+            goto halt;
+        }
+
+        halt: {
+            goto halt;
+        }
+    }
+}
+
+instantiate {
+    sa = SystolicMatmul();
+}
