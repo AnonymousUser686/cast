@@ -11,6 +11,7 @@ enum class TokenType {
     
     // Types
     T_STRING, T_INT, T_FLOAT, T_BYTE, T_INT32, T_UINT32, T_UINT16, T_BOOL,
+    T_INT8, T_UINT8, T_INT16, T_INT64, T_UINT64,
     
     // Literals
     CNAME, INTEGER, HEX, STRING_LIT, NIL,

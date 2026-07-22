@@ -266,9 +266,14 @@ Token Lexer::nextToken() {
                 {"int", TokenType::T_INT},
                 {"float", TokenType::T_FLOAT},
                 {"byte", TokenType::T_BYTE},
+                {"int8", TokenType::T_INT8},
+                {"int16", TokenType::T_INT16},
                 {"int32", TokenType::T_INT32},
+                {"int64", TokenType::T_INT64},
+                {"uint8", TokenType::T_UINT8},
                 {"uint32", TokenType::T_UINT32},
                 {"uint16", TokenType::T_UINT16},
+                {"uint64", TokenType::T_UINT64},
                 {"bool", TokenType::T_BOOL},
                 {"nil", TokenType::NIL}
             };
@@ -853,7 +858,8 @@ std::shared_ptr<ast::Expr> CastParser::parseBinaryExpr(int minPrecedence) {
 }
 
 std::shared_ptr<ast::Expr> CastParser::parseUnaryExpr() {
-    if (peekToken(0).type == TokenType::EXCL || peekToken(0).type == TokenType::AMP || peekToken(0).type == TokenType::STAR) {
+    if (peekToken(0).type == TokenType::EXCL || peekToken(0).type == TokenType::AMP ||
+        peekToken(0).type == TokenType::STAR || peekToken(0).type == TokenType::MINUS) {
         std::string op = peekToken(0).text;
         consume();
         auto un = std::make_shared<ast::UnaryExpr>();
@@ -915,12 +921,11 @@ std::shared_ptr<ast::Expr> CastParser::parsePostfixExpr(std::shared_ptr<ast::Exp
             base = call;
         } else if (peekToken(0).type == TokenType::LBRACKET) {
             consume(); // '['
-            while (peekToken(0).type != TokenType::RBRACKET && peekToken(0).type != TokenType::TOK_EOF) {
-                consume();
-            }
-            expect(TokenType::RBRACKET, "expected ']'");
-            auto dummy = std::make_shared<ast::NilLiteral>();
-            base = dummy;
+            auto idx = std::make_shared<ast::IndexExpr>();
+            idx->base = base;
+            idx->index = parseExpr();
+            expect(TokenType::RBRACKET, "expected ']' after array index");
+            base = idx;
         } else if (peekToken(0).type == TokenType::DOT) {
             consume(); // '.'
             std::string fieldName = peekToken(0).text;
@@ -1028,7 +1033,9 @@ ast::Type CastParser::parseType() {
     ast::Type t;
     if (check(TokenType::T_STRING) || check(TokenType::T_INT) || check(TokenType::T_FLOAT) ||
         check(TokenType::T_BYTE) || check(TokenType::T_INT32) || check(TokenType::T_UINT32) ||
-        check(TokenType::T_UINT16) || check(TokenType::T_BOOL)) {
+        check(TokenType::T_UINT16) || check(TokenType::T_BOOL) ||
+        check(TokenType::T_INT8) || check(TokenType::T_UINT8) || check(TokenType::T_INT16) ||
+        check(TokenType::T_INT64) || check(TokenType::T_UINT64)) {
         t.kind = ast::TypeKind::PRIMITIVE;
         t.name = peekToken(0).text;
         consume();
@@ -1067,24 +1074,57 @@ ast::Type CastParser::parseType() {
 ast::IdentTyped CastParser::parseIdentTyped() {
     ast::IdentTyped it;
     it.type = parseType();
-    
-    if (it.type.kind == ast::TypeKind::CUSTOM && it.type.name.empty()) {
-        if (peekToken(0).type == TokenType::CNAME) {
-            it.idents.push_back(peekToken(0).text);
+
+    // C-style array declarator suffix: `var uint32 a[10];` or `var uint32 m[3][3];`
+    // Returns the dimension sizes following an identifier ([] absent → empty).
+    auto parseArrayDims = [&]() {
+        std::vector<int64_t> dims;
+        while (match(TokenType::LBRACKET)) {
+            if (peekToken(0).type != TokenType::INTEGER && peekToken(0).type != TokenType::HEX) {
+                throw std::runtime_error("Parser error on line " + std::to_string(peekToken(0).line) +
+                                         ": array size must be an integer literal, got '" +
+                                         peekToken(0).text + "'");
+            }
+            int64_t size = std::stoll(peekToken(0).text, nullptr, 0);
+            if (size <= 0) {
+                throw std::runtime_error("Parser error on line " + std::to_string(peekToken(0).line) +
+                                         ": array size must be positive");
+            }
             consume();
+            expect(TokenType::RBRACKET, "expected ']' after array size");
+            dims.push_back(size);
         }
-    } else {
-        if (peekToken(0).type == TokenType::CNAME) {
-            it.idents.push_back(peekToken(0).text);
-            consume();
-        }
+        return dims;
+    };
+
+    std::vector<int64_t> firstDims;
+    if (peekToken(0).type == TokenType::CNAME) {
+        it.idents.push_back(peekToken(0).text);
+        consume();
+        firstDims = parseArrayDims();
     }
-    
+
     while (match(TokenType::COMMA)) {
         if (peekToken(0).type == TokenType::CNAME) {
             it.idents.push_back(peekToken(0).text);
             consume();
+            std::vector<int64_t> dims = parseArrayDims();
+            if (dims != firstDims) {
+                throw std::runtime_error("Parser error on line " + std::to_string(peekToken(0).line) +
+                                         ": all identifiers in one declaration must have the same "
+                                         "array dimensions");
+            }
         }
+    }
+
+    // Wrap the base type in ARRAY layers, innermost dimension last, so that
+    // `uint32 m[3][4]` becomes ARRAY(3, ARRAY(4, uint32)).
+    for (auto d = firstDims.rbegin(); d != firstDims.rend(); ++d) {
+        ast::Type arr;
+        arr.kind = ast::TypeKind::ARRAY;
+        arr.size = *d;
+        arr.elementType = std::make_shared<ast::Type>(it.type);
+        it.type = arr;
     }
     return it;
 }

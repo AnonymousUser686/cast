@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -33,6 +34,7 @@ enum class ASTNodeKind {
     // Expressions
     IdentExpr,
     FieldExpr,
+    IndexExpr,
     NumberLiteral,
     StringLiteral,
     NilLiteral,
@@ -84,6 +86,14 @@ struct FieldExpr : public Expr {
     std::string object;
     std::string field;
     ASTNodeKind getKind() const override { return ASTNodeKind::FieldExpr; }
+};
+
+// Array element access: base[index]. Multi-dimensional access chains
+// (a[i][j]) nest, with the outermost node holding the last index.
+struct IndexExpr : public Expr {
+    std::shared_ptr<Expr> base;
+    std::shared_ptr<Expr> index;
+    ASTNodeKind getKind() const override { return ASTNodeKind::IndexExpr; }
 };
 
 struct NumberLiteral : public Expr {

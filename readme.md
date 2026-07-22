@@ -230,12 +230,15 @@ interface {
 ### shared
 
 Declares registers that persist across states. These become synchronous registers
-(`seq.compreg`) in the generated Verilog.
+(`seq.compreg`) in the generated Verilog. A constant initializer becomes the
+register's reset value (registers without one reset to 0).
 
 ```cast
 shared {
     var uint32 counter;
+    var uint32 threshold = 42;
     var bool   flag;
+    var uint32 window[8];
 }
 ```
 
@@ -283,17 +286,52 @@ goto other_state;
 | cast type | Width | Notes |
 |-----------|-------|-------|
 | `bool`    | 1-bit | |
-| `byte`    | 8-bit | unsigned |
-| `uint16`  | 16-bit | unsigned |
-| `uint32`  | 32-bit | unsigned |
-| `int32`   | 32-bit | signed |
-| `int`     | 32-bit | signed |
+| `byte`, `uint8`, `int8` | 8-bit | |
+| `uint16`, `int16` | 16-bit | |
+| `uint32`, `int32`, `int` | 32-bit | |
+| `uint64`, `int64` | 64-bit | |
+
+Arithmetic and comparisons are currently unsigned regardless of the declared
+signedness.
+
+### Arrays
+
+Arrays are declared with a C-style suffix or a Go-style prefix — both are
+equivalent:
+
+```cast
+shared {
+    var uint32 a[10];        // C-style
+    var [10]uint32 b;        // Go-style
+    var uint32 m[3][3];      // multi-dimensional
+}
+```
+
+An `[N]T` array lowers to N element registers (a register file). Indexing
+works with any integer expression:
+
+- **Constant indices** (literals, enum members, or for-loop variables) select
+  the element register directly at compile time and cost no extra hardware.
+  Out-of-range constant indices are a compile error.
+- **Dynamic indices** (expressions involving runtime registers or channel
+  values) lower to a mux tree on reads and per-element write-enables on
+  writes. An out-of-range dynamic index reads 0 and writes nothing.
+
+```cast
+c[0] = 5;                 // constant index
+c[i] = a[i] + b[i];       // i is a loop variable: resolved at unroll time
+print("val = ", c[idx]);  // idx is a register: mux over all elements
+arr[i] <- in_ch;          // channel receive into an element (state header)
+```
+
+Array initializers (`= {...}`) are not supported — assign elements in a
+state. Arrays cannot be channel (interface) types.
 
 ### Operators
 
 | Category | Operators |
 |----------|-----------|
-| Arithmetic | `+` `-` `*` `/` `%` |
+| Arithmetic | `+` `-` `*` `/` `%` (and unary `-`) |
 | Bitwise | `&` `\|` `^` `<<` `>>` |
 | Comparison | `==` `!=` `<` `<=` `>` `>=` |
 | Logical | `&&` `\|\|` `!` |
@@ -319,6 +357,43 @@ for (var uint16 i = 0; i < 10; i++) { ... }
 
 goto state_name;
 ```
+
+#### for loops
+
+A `for` loop is **fully unrolled at compile time** into the single cycle of
+the state that contains it — it describes replicated hardware, not sequential
+iteration. Consequences:
+
+- The bound must be a compile-time constant: a literal, an expression of
+  literals, or an enclosing loop's variable (`for (var int j = i; ...)` nests
+  fine). A runtime bound is a compile error — for runtime iteration, make a
+  state that increments a shared register and re-enters itself with `goto`
+  (see [array_sum.cast](examples/array_sum.cast)).
+- The init may declare a fresh variable (`var uint16 i = 0`) or assign an
+  existing shared one (`i = 0`; the register receives the final value when
+  the loop ends). Updates may be `i++`, `i--`, or any compound assignment
+  with a constant step (`i += 2`, `i >>= 1`, ...).
+- The loop variable is a compile-time constant in the body: using it in an
+  array index selects elements at zero hardware cost.
+
+**Read-after-write semantics.** Outside loops, register reads return the
+pre-update value — all updates in a state commit together at the end of the
+cycle (this is what makes `b = a + b; a = b;` in fibonacci work). *Inside a
+for-loop body*, reads see values written earlier in the same cycle, in
+program order. This makes unrolled accumulations work as software intuition
+expects:
+
+```cast
+sum = 0;
+for (var int i = 0; i < 10; i++) {
+    sum += data[i];        // single-cycle reduction tree over all 10 elements
+}
+```
+
+The flip side: a shift written low-to-high (`for i: p[i+1] = p[i]`) would
+propagate one value everywhere, exactly as it would in software. Iterate
+high-to-low to shift, as [systolic_matmul.cast](examples/systolic_matmul.cast)
+does.
 
 ### print
 
@@ -361,6 +436,11 @@ instantiate {
 | [binary_search.cast](examples/binary_search.cast) | Advanced | Binary search on a [0, 127] range with multi-cycle halving |
 | [popcount.cast](examples/popcount.cast) | Advanced | Counts set bits in a 16-bit word (LSB-first iteration) |
 | [uart_tx.cast](examples/uart_tx.cast) | Advanced | 8N1 UART transmitter — serialises a byte with start/stop framing |
+| [test_loop.cast](examples/test_loop.cast) | Beginner | Minimal for-loop unrolling demo with per-iteration prints |
+| [array_sum.cast](examples/array_sum.cast) | Intermediate | Arrays + loops: unrolled element-wise sum, single-cycle reduction, and a goto-based runtime drain loop |
+| [matrix_multiply.cast](examples/matrix_multiply.cast) | Intermediate | 2x2 matrix multiply with scalar registers and explicit dot products |
+| [matrix_multiply_loops.cast](examples/matrix_multiply_loops.cast) | Intermediate | 2x2 matrix multiply routed through unrolled loops |
+| [systolic_matmul.cast](examples/systolic_matmul.cast) | Advanced | 3x3 output-stationary systolic array: 9 parallel MAC PEs with skewed operand injection |
 
 Run any example:
 
