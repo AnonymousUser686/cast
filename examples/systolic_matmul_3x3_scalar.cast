@@ -1,4 +1,10 @@
 // 3x3 output-stationary systolic matmul, scalar registers only (old-compiler compatible).
+//
+// Notes for the compiler image on the ORBIT nodes:
+//  - MAC is written c + (a_p * b_p): the parentheses are REQUIRED because that
+//    compiler ignores operator precedence and would otherwise compute (c+a_p)*b_p.
+//  - Each result line prints in its OWN state (one per cycle): multiple prints in
+//    a single state fire on the same clock edge and come out in unspecified order.
 machine SystolicMatmul3x3 {
     interface {}
     shared {
@@ -52,8 +58,17 @@ machine SystolicMatmul3x3 {
         }
         done: {
             print("C = A * B:");
+            goto row_0;
+        }
+        row_0: {
             print("  [ ", c_0_0, " ", c_0_1, " ", c_0_2, " ", "]");
+            goto row_1;
+        }
+        row_1: {
             print("  [ ", c_1_0, " ", c_1_1, " ", c_1_2, " ", "]");
+            goto row_2;
+        }
+        row_2: {
             print("  [ ", c_2_0, " ", c_2_1, " ", c_2_2, " ", "]");
             goto halt;
         }

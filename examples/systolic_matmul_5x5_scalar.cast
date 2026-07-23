@@ -1,25 +1,13 @@
-// 5x5 output-stationary systolic array matrix multiplier.
-// OLD-COMPILER COMPATIBLE: uses only scalar registers, if/else, goto,
-// and print -- no arrays, no for loops, no initializers.
+// 5x5 output-stationary systolic matmul, scalar registers only (old-compiler compatible).
 //
-// Structure: 25 PEs. PE(i,j) owns three registers:
-//   a_p_i_j  A operand, flows left->right    (a_pipe[i][j])
-//   b_p_i_j  B operand, flows top->bottom    (b_pipe[i][j])
-//   c_i_j    stationary accumulator
-// Each `step` cycle: every PE does c += a_p * b_p, then operands shift
-// one PE right/down. Row i of A enters at the left edge skewed by i
-// cycles; column j of B enters at the top skewed by j. PE(i,j) meets
-// a[i][k] and b[k][j] together at cycle t = i + j + k + 1; the last
-// product lands at t = 13, so 14 step cycles (t = 0..13) finish C = A*B.
-//
-// All reads in a state see start-of-cycle register values (registers
-// commit together at the cycle end), so every shift/MAC below happens
-// simultaneously across all 25 PEs -- statement order does not matter.
-
+// Notes for the compiler image on the ORBIT nodes:
+//  - MAC is written c + (a_p * b_p): the parentheses are REQUIRED because that
+//    compiler ignores operator precedence and would otherwise compute (c+a_p)*b_p.
+//  - Each result line prints in its OWN state (one per cycle): multiple prints in
+//    a single state fire on the same clock edge and come out in unspecified order.
 machine SystolicMatmul5x5 {
     interface {}
     shared {
-        // operand matrices
         var uint32 a_0_0; var uint32 a_0_1; var uint32 a_0_2; var uint32 a_0_3; var uint32 a_0_4;
         var uint32 a_1_0; var uint32 a_1_1; var uint32 a_1_2; var uint32 a_1_3; var uint32 a_1_4;
         var uint32 a_2_0; var uint32 a_2_1; var uint32 a_2_2; var uint32 a_2_3; var uint32 a_2_4;
@@ -30,7 +18,6 @@ machine SystolicMatmul5x5 {
         var uint32 b_2_0; var uint32 b_2_1; var uint32 b_2_2; var uint32 b_2_3; var uint32 b_2_4;
         var uint32 b_3_0; var uint32 b_3_1; var uint32 b_3_2; var uint32 b_3_3; var uint32 b_3_4;
         var uint32 b_4_0; var uint32 b_4_1; var uint32 b_4_2; var uint32 b_4_3; var uint32 b_4_4;
-        // PE operand pipes
         var uint32 a_p_0_0; var uint32 a_p_0_1; var uint32 a_p_0_2; var uint32 a_p_0_3; var uint32 a_p_0_4;
         var uint32 a_p_1_0; var uint32 a_p_1_1; var uint32 a_p_1_2; var uint32 a_p_1_3; var uint32 a_p_1_4;
         var uint32 a_p_2_0; var uint32 a_p_2_1; var uint32 a_p_2_2; var uint32 a_p_2_3; var uint32 a_p_2_4;
@@ -41,13 +28,11 @@ machine SystolicMatmul5x5 {
         var uint32 b_p_2_0; var uint32 b_p_2_1; var uint32 b_p_2_2; var uint32 b_p_2_3; var uint32 b_p_2_4;
         var uint32 b_p_3_0; var uint32 b_p_3_1; var uint32 b_p_3_2; var uint32 b_p_3_3; var uint32 b_p_3_4;
         var uint32 b_p_4_0; var uint32 b_p_4_1; var uint32 b_p_4_2; var uint32 b_p_4_3; var uint32 b_p_4_4;
-        // PE accumulators
         var uint32 c_0_0; var uint32 c_0_1; var uint32 c_0_2; var uint32 c_0_3; var uint32 c_0_4;
         var uint32 c_1_0; var uint32 c_1_1; var uint32 c_1_2; var uint32 c_1_3; var uint32 c_1_4;
         var uint32 c_2_0; var uint32 c_2_1; var uint32 c_2_2; var uint32 c_2_3; var uint32 c_2_4;
         var uint32 c_3_0; var uint32 c_3_1; var uint32 c_3_2; var uint32 c_3_3; var uint32 c_3_4;
         var uint32 c_4_0; var uint32 c_4_1; var uint32 c_4_2; var uint32 c_4_3; var uint32 c_4_4;
-        // systolic cycle counter
         var uint32 t;
     }
     states {
@@ -62,68 +47,64 @@ machine SystolicMatmul5x5 {
             b_2_0 = 3; b_2_1 = 6; b_2_2 = 9; b_2_3 = 12; b_2_4 = 15;
             b_3_0 = 4; b_3_1 = 8; b_3_2 = 12; b_3_3 = 16; b_3_4 = 20;
             b_4_0 = 5; b_4_1 = 10; b_4_2 = 15; b_4_3 = 20; b_4_4 = 25;
-            print("[load] A and B loaded (A = 1..25 row-major, B[i][j] = (i+1)*(j+1))");
+            print("[load] done");
             goto step;
         }
-
         step: {
-            // MAC phase: every PE accumulates its current operand pair.
             c_0_0 = c_0_0 + (a_p_0_0 * b_p_0_0); c_0_1 = c_0_1 + (a_p_0_1 * b_p_0_1); c_0_2 = c_0_2 + (a_p_0_2 * b_p_0_2); c_0_3 = c_0_3 + (a_p_0_3 * b_p_0_3); c_0_4 = c_0_4 + (a_p_0_4 * b_p_0_4);
             c_1_0 = c_1_0 + (a_p_1_0 * b_p_1_0); c_1_1 = c_1_1 + (a_p_1_1 * b_p_1_1); c_1_2 = c_1_2 + (a_p_1_2 * b_p_1_2); c_1_3 = c_1_3 + (a_p_1_3 * b_p_1_3); c_1_4 = c_1_4 + (a_p_1_4 * b_p_1_4);
             c_2_0 = c_2_0 + (a_p_2_0 * b_p_2_0); c_2_1 = c_2_1 + (a_p_2_1 * b_p_2_1); c_2_2 = c_2_2 + (a_p_2_2 * b_p_2_2); c_2_3 = c_2_3 + (a_p_2_3 * b_p_2_3); c_2_4 = c_2_4 + (a_p_2_4 * b_p_2_4);
             c_3_0 = c_3_0 + (a_p_3_0 * b_p_3_0); c_3_1 = c_3_1 + (a_p_3_1 * b_p_3_1); c_3_2 = c_3_2 + (a_p_3_2 * b_p_3_2); c_3_3 = c_3_3 + (a_p_3_3 * b_p_3_3); c_3_4 = c_3_4 + (a_p_3_4 * b_p_3_4);
             c_4_0 = c_4_0 + (a_p_4_0 * b_p_4_0); c_4_1 = c_4_1 + (a_p_4_1 * b_p_4_1); c_4_2 = c_4_2 + (a_p_4_2 * b_p_4_2); c_4_3 = c_4_3 + (a_p_4_3 * b_p_4_3); c_4_4 = c_4_4 + (a_p_4_4 * b_p_4_4);
-
-            // A shift: values move right (reads are pre-shift values).
             a_p_0_4 = a_p_0_3; a_p_0_3 = a_p_0_2; a_p_0_2 = a_p_0_1; a_p_0_1 = a_p_0_0;
             a_p_1_4 = a_p_1_3; a_p_1_3 = a_p_1_2; a_p_1_2 = a_p_1_1; a_p_1_1 = a_p_1_0;
             a_p_2_4 = a_p_2_3; a_p_2_3 = a_p_2_2; a_p_2_2 = a_p_2_1; a_p_2_1 = a_p_2_0;
             a_p_3_4 = a_p_3_3; a_p_3_3 = a_p_3_2; a_p_3_2 = a_p_3_1; a_p_3_1 = a_p_3_0;
             a_p_4_4 = a_p_4_3; a_p_4_3 = a_p_4_2; a_p_4_2 = a_p_4_1; a_p_4_1 = a_p_4_0;
-            // A feeders: row i receives a[i][t - i], skewed by i cycles.
             if (t == 0) { a_p_0_0 = a_0_0; } else if (t == 1) { a_p_0_0 = a_0_1; } else if (t == 2) { a_p_0_0 = a_0_2; } else if (t == 3) { a_p_0_0 = a_0_3; } else if (t == 4) { a_p_0_0 = a_0_4; } else { a_p_0_0 = 0; }
             if (t == 1) { a_p_1_0 = a_1_0; } else if (t == 2) { a_p_1_0 = a_1_1; } else if (t == 3) { a_p_1_0 = a_1_2; } else if (t == 4) { a_p_1_0 = a_1_3; } else if (t == 5) { a_p_1_0 = a_1_4; } else { a_p_1_0 = 0; }
             if (t == 2) { a_p_2_0 = a_2_0; } else if (t == 3) { a_p_2_0 = a_2_1; } else if (t == 4) { a_p_2_0 = a_2_2; } else if (t == 5) { a_p_2_0 = a_2_3; } else if (t == 6) { a_p_2_0 = a_2_4; } else { a_p_2_0 = 0; }
             if (t == 3) { a_p_3_0 = a_3_0; } else if (t == 4) { a_p_3_0 = a_3_1; } else if (t == 5) { a_p_3_0 = a_3_2; } else if (t == 6) { a_p_3_0 = a_3_3; } else if (t == 7) { a_p_3_0 = a_3_4; } else { a_p_3_0 = 0; }
             if (t == 4) { a_p_4_0 = a_4_0; } else if (t == 5) { a_p_4_0 = a_4_1; } else if (t == 6) { a_p_4_0 = a_4_2; } else if (t == 7) { a_p_4_0 = a_4_3; } else if (t == 8) { a_p_4_0 = a_4_4; } else { a_p_4_0 = 0; }
-
-            // B shift: values move down.
             b_p_4_0 = b_p_3_0; b_p_3_0 = b_p_2_0; b_p_2_0 = b_p_1_0; b_p_1_0 = b_p_0_0;
             b_p_4_1 = b_p_3_1; b_p_3_1 = b_p_2_1; b_p_2_1 = b_p_1_1; b_p_1_1 = b_p_0_1;
             b_p_4_2 = b_p_3_2; b_p_3_2 = b_p_2_2; b_p_2_2 = b_p_1_2; b_p_1_2 = b_p_0_2;
             b_p_4_3 = b_p_3_3; b_p_3_3 = b_p_2_3; b_p_2_3 = b_p_1_3; b_p_1_3 = b_p_0_3;
             b_p_4_4 = b_p_3_4; b_p_3_4 = b_p_2_4; b_p_2_4 = b_p_1_4; b_p_1_4 = b_p_0_4;
-            // B feeders: column j receives b[t - j][j], skewed by j cycles.
             if (t == 0) { b_p_0_0 = b_0_0; } else if (t == 1) { b_p_0_0 = b_1_0; } else if (t == 2) { b_p_0_0 = b_2_0; } else if (t == 3) { b_p_0_0 = b_3_0; } else if (t == 4) { b_p_0_0 = b_4_0; } else { b_p_0_0 = 0; }
             if (t == 1) { b_p_0_1 = b_0_1; } else if (t == 2) { b_p_0_1 = b_1_1; } else if (t == 3) { b_p_0_1 = b_2_1; } else if (t == 4) { b_p_0_1 = b_3_1; } else if (t == 5) { b_p_0_1 = b_4_1; } else { b_p_0_1 = 0; }
             if (t == 2) { b_p_0_2 = b_0_2; } else if (t == 3) { b_p_0_2 = b_1_2; } else if (t == 4) { b_p_0_2 = b_2_2; } else if (t == 5) { b_p_0_2 = b_3_2; } else if (t == 6) { b_p_0_2 = b_4_2; } else { b_p_0_2 = 0; }
             if (t == 3) { b_p_0_3 = b_0_3; } else if (t == 4) { b_p_0_3 = b_1_3; } else if (t == 5) { b_p_0_3 = b_2_3; } else if (t == 6) { b_p_0_3 = b_3_3; } else if (t == 7) { b_p_0_3 = b_4_3; } else { b_p_0_3 = 0; }
             if (t == 4) { b_p_0_4 = b_0_4; } else if (t == 5) { b_p_0_4 = b_1_4; } else if (t == 6) { b_p_0_4 = b_2_4; } else if (t == 7) { b_p_0_4 = b_3_4; } else if (t == 8) { b_p_0_4 = b_4_4; } else { b_p_0_4 = 0; }
-
             print("[step] t = ", t);
             t = t + 1;
-            // reads see the pre-increment t: last useful MAC is at t = 13
-            if (t < 13) {
-                goto step;
-            } else {
-                goto done;
-            }
+            if (t < 13) { goto step; } else { goto done; }
         }
-
         done: {
             print("C = A * B:");
+            goto row_0;
+        }
+        row_0: {
             print("  [ ", c_0_0, " ", c_0_1, " ", c_0_2, " ", c_0_3, " ", c_0_4, " ", "]");
+            goto row_1;
+        }
+        row_1: {
             print("  [ ", c_1_0, " ", c_1_1, " ", c_1_2, " ", c_1_3, " ", c_1_4, " ", "]");
+            goto row_2;
+        }
+        row_2: {
             print("  [ ", c_2_0, " ", c_2_1, " ", c_2_2, " ", c_2_3, " ", c_2_4, " ", "]");
+            goto row_3;
+        }
+        row_3: {
             print("  [ ", c_3_0, " ", c_3_1, " ", c_3_2, " ", c_3_3, " ", c_3_4, " ", "]");
+            goto row_4;
+        }
+        row_4: {
             print("  [ ", c_4_0, " ", c_4_1, " ", c_4_2, " ", c_4_3, " ", c_4_4, " ", "]");
-            // expected: [ 55 110 165 220 275 ; 130 260 390 520 650 ; 205 410 615 820 1025 ; 280 560 840 1120 1400 ; 355 710 1065 1420 1775 ]
             goto halt;
         }
-
-        halt: {
-            goto halt;
-        }
+        halt: { goto halt; }
     }
 }
 
