@@ -1,0 +1,53 @@
+// 2x2 output-stationary systolic matmul, scalar registers only (old-compiler compatible).
+machine SystolicMatmul2x2 {
+    interface {}
+    shared {
+        var uint32 a_0_0; var uint32 a_0_1;
+        var uint32 a_1_0; var uint32 a_1_1;
+        var uint32 b_0_0; var uint32 b_0_1;
+        var uint32 b_1_0; var uint32 b_1_1;
+        var uint32 a_p_0_0; var uint32 a_p_0_1;
+        var uint32 a_p_1_0; var uint32 a_p_1_1;
+        var uint32 b_p_0_0; var uint32 b_p_0_1;
+        var uint32 b_p_1_0; var uint32 b_p_1_1;
+        var uint32 c_0_0; var uint32 c_0_1;
+        var uint32 c_1_0; var uint32 c_1_1;
+        var uint32 t;
+    }
+    states {
+        load: {
+            a_0_0 = 1; a_0_1 = 2;
+            a_1_0 = 3; a_1_1 = 4;
+            b_0_0 = 1; b_0_1 = 2;
+            b_1_0 = 2; b_1_1 = 4;
+            print("[load] done");
+            goto step;
+        }
+        step: {
+            c_0_0 = c_0_0 + a_p_0_0 * b_p_0_0; c_0_1 = c_0_1 + a_p_0_1 * b_p_0_1;
+            c_1_0 = c_1_0 + a_p_1_0 * b_p_1_0; c_1_1 = c_1_1 + a_p_1_1 * b_p_1_1;
+            a_p_0_1 = a_p_0_0;
+            a_p_1_1 = a_p_1_0;
+            if (t == 0) { a_p_0_0 = a_0_0; } else if (t == 1) { a_p_0_0 = a_0_1; } else { a_p_0_0 = 0; }
+            if (t == 1) { a_p_1_0 = a_1_0; } else if (t == 2) { a_p_1_0 = a_1_1; } else { a_p_1_0 = 0; }
+            b_p_1_0 = b_p_0_0;
+            b_p_1_1 = b_p_0_1;
+            if (t == 0) { b_p_0_0 = b_0_0; } else if (t == 1) { b_p_0_0 = b_1_0; } else { b_p_0_0 = 0; }
+            if (t == 1) { b_p_0_1 = b_0_1; } else if (t == 2) { b_p_0_1 = b_1_1; } else { b_p_0_1 = 0; }
+            print("[step] t = ", t);
+            t = t + 1;
+            if (t < 4) { goto step; } else { goto done; }
+        }
+        done: {
+            print("C = A * B:");
+            print("  [ ", c_0_0, " ", c_0_1, " ", "]");
+            print("  [ ", c_1_0, " ", c_1_1, " ", "]");
+            goto halt;
+        }
+        halt: { goto halt; }
+    }
+}
+
+instantiate {
+    sa = SystolicMatmul2x2();
+}
