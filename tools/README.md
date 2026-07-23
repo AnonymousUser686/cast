@@ -9,13 +9,22 @@ and then interprets the AST using the same semantics the MLIR lowering in
 the cycle boundary, compile-time-unrolled `for` loops, per-element array storage,
 and the "reads inside a loop see same-cycle writes" rule.
 
-Use it to sanity-check array / for-loop behaviour and predict a program's `print`
-output on a machine that does **not** have the LLVM + CIRCT + iverilog toolchain
-installed. The real `castc` build remains the source of truth for synthesizable
-Verilog; if the two ever disagree, that is a bug worth chasing.
+Use it to sanity-check cast programs and predict their `print` output on a
+machine that does **not** have the LLVM + CIRCT + iverilog toolchain installed.
+The real `castc` build remains the source of truth for synthesizable Verilog;
+if the two ever disagree, that is a bug worth chasing. (Known limitation: it
+uses the *current* parser, so it will not reproduce bugs baked into older
+prebuilt compiler images.)
 
-It does not model interface channels, `instantiate` wiring, enums, `switch`, or
-exceptions — programs using those must be checked with the real toolchain.
+Modelled: multiple machine instances, machine-to-machine channel wiring
+(`b.in <- a.out`, point-to-point, depth-5 FIFO, one-cycle latency,
+drop-when-full), constant feeds (always-valid streams), header receives that
+stall the state until data arrives, output sends, arrays, unrolled for loops,
+if/goto. Within one cycle, prints from different instances appear in instance
+declaration order (real hardware leaves same-edge print order unspecified).
+
+NOT modelled: enums, `switch`, exceptions, machine compile-time parameters —
+programs using those must be checked with the real toolchain.
 
 ### Build
 

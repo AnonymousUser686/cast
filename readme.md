@@ -344,7 +344,8 @@ state. Arrays cannot be channel (interface) types.
 |--------|---------|
 | `ch -> v` | Receive from channel `ch` into local binding `v` (state header) |
 | `ch <- expr` | Send `expr` on output channel `ch` |
-| `inst.port <- expr` | Feed a value into instance `inst`'s input channel |
+| `inst.port <- expr` | Feed a constant into instance `inst`'s input channel (always-valid stream) |
+| `b.in <- a.out` | Connect instance `a`'s output channel to instance `b`'s input channel |
 
 ### Control flow
 
@@ -406,16 +407,41 @@ print("a=", a, " b=", b);
 
 ### instantiate
 
-The `instantiate` block creates machine instances and feeds their input channels.
-Feeds become preloaded FIFO register values — the machine sees them on its first
-cycle.
+The `instantiate` block creates machine instances, feeds their input channels,
+and wires machines together.
 
 ```cast
 instantiate {
     m = MyMachine();
-    m.data <- 42;
+    m.data <- 42;          // constant feed: an always-valid stream of 42s
+
+    a = Producer();
+    b = Consumer();
+    b.in <- a.out;         // machine-to-machine connection
 }
 ```
+
+**Constant feeds** (`m.port <- 42`) drive the input with an always-valid
+stream of that value — the machine sees it every cycle it asks.
+
+**Machine-to-machine connections** (`b.in <- a.out`) wire one instance's
+output channel into another's input channel:
+
+- Channels are **point-to-point**: each output may feed exactly one input,
+  and each input may have exactly one source (a constant feed or one
+  connection, not both). Violations are compile errors.
+- Both ports must be declared with the **same type**.
+- Every connection is decoupled by a small FIFO, so a value sent on cycle T
+  is receivable at cycle T+1. The consumer's header receive blocks until
+  data arrives, so pipelines self-synchronise.
+- Sends are fire-and-forget: if a connection's FIFO is full (consumer
+  stalled for >5 cycles while the producer keeps sending), further sends
+  are dropped. Design consumers to keep up, or throttle producers.
+- Declare both instances before connecting them; feedback loops
+  (`a.in <- b.out; b.in <- a.out;`) are allowed.
+
+See [pipeline.cast](examples/pipeline.cast) for a three-stage
+producer → doubler → printer chain.
 
 ---
 

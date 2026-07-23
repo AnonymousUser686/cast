@@ -19,6 +19,7 @@
 #include <any>
 #include <optional>
 #include <map>
+#include <set>
 #include "CastAST.hpp"
 
 class LowerVisitor
@@ -84,11 +85,25 @@ private:
     std::unordered_map<std::string, mlir::Type> states;
     std::unordered_map<std::string, circt::hw::HWModuleOp> modules;
     std::unordered_map<std::string, circt::hw::InstanceOp> instances;
-    // FIFO feed registers created in visitInst_module, keyed by [instanceName][portName].
-    // Patched when the instantiate block contains `m.port <- value`.
+    // Input-channel feed plumbing created in visitInst_module, keyed by
+    // [instanceName][portName]. A constant feed (`m.port <- 42`) patches the
+    // data/valid registers; a machine-to-machine connection
+    // (`b.in <- a.out`) replaces the whole feed with a FIFO stage fed by the
+    // source instance's output channel and erases these placeholder ops.
+    struct InstanceFeed {
+        circt::seq::CompRegOp dataReg;
+        circt::seq::CompRegOp validReg;
+        circt::esi::WrapValidReadyOp wrap;
+        circt::esi::FIFOOp fifo;
+        unsigned operandIdx = 0;   // position on the InstanceOp operand list
+        bool fedConstant = false;
+        bool fedChannel = false;
+    };
     std::unordered_map<std::string,
-        std::unordered_map<std::string,
-            std::pair<circt::seq::CompRegOp, circt::seq::CompRegOp>>> instanceFifoRegs;
+        std::unordered_map<std::string, InstanceFeed>> instanceFeeds;
+    // Instance outputs already wired to a consumer. ESI channels are
+    // point-to-point, so each output may feed at most one input.
+    std::set<std::pair<std::string, std::string>> connectedOutputs;
     mlir::Value currentClock;
 
     // Array storage: arrays lower to one register per element, stored in

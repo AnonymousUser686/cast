@@ -1125,6 +1125,107 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
     if (srcAny.has_value() && srcAny.type() == typeid(mlir::Value))
       srcVal = std::any_cast<mlir::Value>(srcAny);
 
+    // ── instantiate block: feed or wire instance input channels ────────────
+    if (this->insideInsantiate) {
+      if (!dstIsField)
+        return std::any();
+      if (!this->instances.count(dstInst)) {
+        std::cerr << "Error: unknown instance '" << dstInst
+                  << "' in instantiate block (declare instances before "
+                     "feeding or connecting them).\n";
+        exit(1);
+      }
+      auto &feeds = this->instanceFeeds[dstInst];
+      auto portIt = feeds.find(dstPort);
+      if (portIt == feeds.end()) {
+        std::cerr << "Error: instance '" << dstInst
+                  << "' has no input channel named '" << dstPort << "'.\n";
+        exit(1);
+      }
+      if (!srcVal) {
+        std::cerr << "Error: cannot evaluate the value fed to '" << dstInst
+                  << "." << dstPort
+                  << "' (connect instance outputs as <inst>.<port>, with "
+                     "both instances declared beforehand).\n";
+        exit(1);
+      }
+      InstanceFeed &feed = portIt->second;
+      circt::hw::InstanceOp inst = this->instances[dstInst];
+
+      if (auto chSrc =
+              mlir::dyn_cast<mlir::TypedValue<circt::esi::ChannelType>>(
+                  srcVal)) {
+        // Machine-to-machine connection: b.in <- a.out
+        if (feed.fedChannel || feed.fedConstant) {
+          std::cerr << "Error: input '" << dstInst << "." << dstPort
+                    << "' is already driven; each input channel may have "
+                       "only one source.\n";
+          exit(1);
+        }
+        // ESI channels are point-to-point: one consumer per output.
+        if (srcExpr->getKind() == ast::ASTNodeKind::FieldExpr) {
+          auto *sf = static_cast<ast::FieldExpr *>(srcExpr.get());
+          std::pair<std::string, std::string> key = {sf->object, sf->field};
+          if (this->connectedOutputs.count(key)) {
+            std::cerr << "Error: output '" << sf->object << "." << sf->field
+                      << "' is already connected; an output channel may "
+                         "feed only one input.\n";
+            exit(1);
+          }
+          this->connectedOutputs.insert(key);
+        }
+        mlir::Type portTy = inst->getOperand(feed.operandIdx).getType();
+        if (chSrc.getType() != portTy) {
+          auto srcCh = chSrc.getType();
+          auto dstCh = mlir::cast<circt::esi::ChannelType>(portTy);
+          std::cerr << "Error: channel type mismatch connecting to '"
+                    << dstInst << "." << dstPort << "'";
+          auto srcInt = mlir::dyn_cast<mlir::IntegerType>(srcCh.getInner());
+          auto dstInt = mlir::dyn_cast<mlir::IntegerType>(dstCh.getInner());
+          if (srcInt && dstInt)
+            std::cerr << ": source is " << srcInt.getWidth()
+                      << " bits, destination is " << dstInt.getWidth()
+                      << " bits";
+          std::cerr << ". Declare both ports with the same type.\n";
+          exit(1);
+        }
+        // Insert a FIFO stage so producer and consumer are decoupled, then
+        // swap it in as the instance's input. HW module bodies are graph
+        // regions, so the connection is legal regardless of declaration
+        // order of the two instances.
+        circt::esi::FIFOOp stage = circt::esi::FIFOOp::create(
+            builder, loc, portTy, this->currentClock, this->currentReset,
+            chSrc, 5);
+        inst->setOperand(feed.operandIdx, stage.getResult());
+        // The placeholder constant-feed plumbing is now dead; remove it in
+        // use-order (fifo uses wrap, wrap uses the regs).
+        feed.fifo->erase();
+        feed.wrap->erase();
+        feed.dataReg->erase();
+        feed.validReg->erase();
+        feed.fedChannel = true;
+        return std::any();
+      }
+
+      // Constant/value preload (previous behaviour): patch the feed regs.
+      if (feed.fedChannel) {
+        std::cerr << "Error: input '" << dstInst << "." << dstPort
+                  << "' is already connected to a machine output; it cannot "
+                     "also be fed a value.\n";
+        exit(1);
+      }
+      mlir::Type innerTy = feed.dataReg.getResult().getType();
+      mlir::Value data = coerce(srcVal, innerTy, loc);
+      mlir::Value trueV =
+          circt::hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
+      feed.dataReg->setOperand(0, data);
+      feed.dataReg->setOperand(3, data);
+      feed.validReg->setOperand(0, trueV);
+      feed.validReg->setOperand(3, trueV);
+      feed.fedConstant = true;
+      return std::any();
+    }
+
     if (srcVal) {
       if (auto chSrc =
               mlir::dyn_cast<mlir::TypedValue<circt::esi::ChannelType>>(
@@ -1197,23 +1298,6 @@ std::any LowerVisitor::visitStmt_binary(ast::BinaryStmt &stmt) {
       return std::any();
     }
 
-    if (dstIsField && this->insideInsantiate && srcVal) {
-      auto instIt = this->instanceFifoRegs.find(dstInst);
-      if (instIt != this->instanceFifoRegs.end()) {
-        auto portIt = instIt->second.find(dstPort);
-        if (portIt != instIt->second.end()) {
-          auto [dataReg, validReg] = portIt->second;
-          mlir::Type innerTy = dataReg.getResult().getType();
-          mlir::Value data = coerce(srcVal, innerTy, loc);
-          mlir::Value trueV = circt::hw::ConstantOp::create(
-              builder, loc, builder.getI1Type(), 1);
-          dataReg->setOperand(0, data);
-          dataReg->setOperand(3, data);
-          validReg->setOperand(0, trueV);
-          validReg->setOperand(3, trueV);
-        }
-      }
-    }
     return std::any();
   }
 
@@ -1320,8 +1404,6 @@ std::any LowerVisitor::visitInst_module(ast::InstModuleStmt &stmt) {
       circt::seq::CompRegOp channel_valid = circt::seq::CompRegOp::create(
           builder, builder.getUnknownLoc(), dummyValid, this->currentClock,
           this->currentReset, dummyValid);
-      this->instanceFifoRegs[varName][port.name.str()] = {channel_data,
-                                                          channel_valid};
       circt::esi::WrapValidReadyOp vr = circt::esi::WrapValidReadyOp::create(
           builder, builder.getUnknownLoc(), portType, builder.getI1Type(),
           channel_data, channel_valid);
@@ -1329,6 +1411,13 @@ std::any LowerVisitor::visitInst_module(ast::InstModuleStmt &stmt) {
       circt::esi::FIFOOp fifo = circt::esi::FIFOOp::create(
           builder, builder.getUnknownLoc(), port.type, this->currentClock,
           this->currentReset, ch_in, 5);
+      InstanceFeed feed;
+      feed.dataReg = channel_data;
+      feed.validReg = channel_valid;
+      feed.wrap = vr;
+      feed.fifo = fifo;
+      feed.operandIdx = (unsigned)instanceOperands.size();
+      this->instanceFeeds[varName][port.name.str()] = feed;
       instanceOperands.push_back(fifo.getResult());
     } else if (mlir::isa<circt::seq::ClockType>(portType)) {
       instanceOperands.push_back(this->currentClock);

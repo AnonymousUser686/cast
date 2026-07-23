@@ -1,0 +1,69 @@
+// Machine-to-machine channel wiring: a three-stage pipeline.
+//
+//   Producer --> Doubler --> Printer
+//
+// The instantiate block connects one instance's output channel to another
+// instance's input channel with `dst.in <- src.out`. Each connection is
+// point-to-point (one producer, one consumer) and is decoupled by a small
+// FIFO, so the stages run in lockstep with back-to-back streaming: a
+// consumer's state simply blocks (its header receive sees no valid data)
+// until the upstream value arrives.
+//
+// Expected output: got 0, got 2, got 4, got 6, got 8.
+
+machine Producer {
+    interface {
+        output uint16 out;
+    }
+    shared {
+        var uint16 n;
+    }
+    states {
+        gen: {
+            if (n < 5) {
+                out <- n;      // sends 0,1,2,3,4 on successive cycles
+                n++;
+                goto gen;
+            } else {
+                goto halt;
+            }
+        }
+        halt: {
+            goto halt;
+        }
+    }
+}
+
+machine Doubler {
+    interface {
+        input  uint16 in;
+        output uint16 out;
+    }
+    states {
+        run: in -> x {
+            out <- x + x;
+            goto run;
+        }
+    }
+}
+
+machine Printer {
+    interface {
+        input uint16 in;
+    }
+    states {
+        run: in -> x {
+            print("got ", x);
+            goto run;
+        }
+    }
+}
+
+instantiate {
+    p  = Producer();
+    d  = Doubler();
+    pr = Printer();
+
+    d.in  <- p.out;    // wire Producer's output into Doubler
+    pr.in <- d.out;    // wire Doubler's output into Printer
+}

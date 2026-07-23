@@ -3,32 +3,39 @@
 // This is NOT the real compiler. It reuses the real cast parser
 // (src/Frontend/CastParser.cpp) so parsing is identical to castc, then walks
 // the AST applying the SAME semantics the MLIR lowering in castLower.cpp
-// implements, and prints what a `print(...)` would emit. It exists so the
-// array / for-loop behaviour can be checked on a machine that does not have
-// the LLVM + CIRCT + iverilog toolchain installed.
+// implements, and prints what a `print(...)` would emit. It exists so cast
+// behaviour can be checked on a machine without the LLVM + CIRCT + iverilog
+// toolchain.
 //
 // Modelled faithfully:
-//   * shared scalars and arrays (one register per element, "a[i][j]" keys)
-//   * constant AND dynamic array indices (out-of-range dyn read = 0, write = nop)
-//   * compile-time-unrolled for loops (bounds must be constants)
-//   * read-after-write: inside a for-loop body reads see writes made earlier
-//     in the same cycle; outside loops reads return the start-of-cycle value
-//     (registers commit together at the cycle end) — matches readVar()
-//   * if / else-if / else, taken-path execution
-//   * one active state per cycle, goto selects the next state
+//   * multiple machine instances from the instantiate block, all on one clock
+//   * machine-to-machine channel wiring (`b.in <- a.out`): point-to-point,
+//     decoupled by a depth-5 FIFO; a value sent on cycle T is receivable at
+//     cycle T+1; if the FIFO is full the send is dropped (the generated
+//     hardware ignores the ready signal on machine outputs)
+//   * constant feeds (`m.port <- 42`): an always-valid stream of that value,
+//     matching the patched always-valid feed registers in the lowering
+//   * header receives (`s: ch -> x` / `s: x <- ch`) gate the state body: in
+//     cycles with no valid data the body does not run and the state re-tries
+//   * output sends (`out <- expr`) from state bodies
+//   * shared scalars and arrays, constant AND dynamic indices, unrolled for
+//     loops (with same-cycle read-after-write inside loop bodies), if/else,
+//     goto; registers commit together at the cycle boundary
 //
-// NOT modelled (not needed for the array/loop examples): interface channels,
-// instantiate wiring, enums, exceptions, switch. Programs using those should
-// be checked with the real toolchain.
+// NOT modelled: enums, switch, exceptions, machine compile-time parameters.
+// Within one cycle, prints from different instances appear in instance
+// declaration order (real hardware leaves same-edge ordering unspecified).
 //
 // Usage: cast_sim [--max-cycles=N] [--trace] <file.cast>
 
 #include "CastParser.hpp"
 #include "CastAST.hpp"
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -57,73 +64,128 @@ int typeWidth(const Type &t) {
     return 32;
 }
 
-class Sim {
-public:
-    explicit Sim(MachineDecl *m) : machine(m) {}
+// A channel between a producer output and a consumer input. Mirrors the
+// esi.fifo the lowering inserts: capacity 5, one-cycle latency (staged pushes
+// commit at the cycle boundary), drop when full.
+struct ChanQueue {
+    static constexpr size_t CAP = 5;
+    bool isConst = false;      // constant feed: always-valid infinite stream
+    uint64_t constVal = 0;
+    std::deque<uint64_t> q;
+    std::vector<uint64_t> staged;
+    bool driven = false;       // has a wire or constant feed attached
 
-    void run(int maxCycles, bool trace) {
-        setup();
-        if (stateOrder.empty()) throw SimError("machine has no states");
-
-        std::string cur = stateOrder.front();
-        int idle = 0;
-        for (int cycle = 0; cycle < maxCycles; ++cycle) {
-            next = committed;                 // registers hold, then update
-            nextState = cur;
-            size_t outBefore = out.size();
-
-            if (trace) out.push_back("--- cycle " + std::to_string(cycle) +
-                                     " : state " + cur + " ---");
-
-            forDepth = 0;
-            StateDecl *sd = stateByName.at(cur);
-            if (sd->body)
-                for (auto &s : sd->body->statements) exec(s.get());
-
-            committed = next;
-            bool producedOutput = out.size() > outBefore + (trace ? 1 : 0);
-            bool stayed = (nextState == cur);
-            cur = nextState;
-
-            // Stop once we settle into a self-looping state that prints nothing
-            // (the conventional `halt: { goto halt; }`).
-            if (stayed && !producedOutput) {
-                if (++idle >= 1) break;
-            } else {
-                idle = 0;
-            }
-        }
-
-        for (auto &line : out) std::cout << line << "\n";
+    bool hasData() const { return isConst || !q.empty(); }
+    uint64_t pop() {
+        if (isConst) return constVal;
+        uint64_t v = q.front();
+        q.pop_front();
+        return v;
     }
+    void commit() {
+        for (uint64_t v : staged)
+            if (q.size() < CAP) q.push_back(v);   // overflow -> dropped
+        staged.clear();
+    }
+};
 
-private:
-    MachineDecl *machine;
+struct MachineInfo {
+    MachineDecl *decl = nullptr;
+    std::set<std::string> inputs, outputs;
+};
+
+// One machine instance: its registers, state, and executor.
+class Inst {
+public:
+    std::string name;
+    MachineInfo *mi = nullptr;
 
     std::map<std::string, uint64_t> committed, next;
-    std::map<std::string, int> width;              // per scalar / element key
+    std::map<std::string, int> width;
     std::map<std::string, std::vector<int64_t>> arrayDims;
     std::map<std::string, int> arrayElemWidth;
     std::set<std::string> arrays;
 
     std::map<std::string, int64_t> loopConsts;
+    std::map<std::string, uint64_t> localBindings;   // header receives
     int forDepth = 0;
 
     std::vector<std::string> stateOrder;
     std::map<std::string, StateDecl *> stateByName;
-    std::string nextState;
+    std::string state, nextState;
 
-    std::vector<std::string> out;
+    std::map<std::string, ChanQueue *> inQ;    // input port  -> queue
+    std::map<std::string, ChanQueue *> outW;   // output port -> dest queue
 
-    // ── setup ────────────────────────────────────────────────────────────────
+    std::vector<std::string> *out = nullptr;   // shared print sink
+
     void setup() {
-        if (machine->sharedBlock)
-            for (auto &v : machine->sharedBlock->varDecls) declareShared(*v);
-        if (machine->statesBlock)
-            for (auto &sd : machine->statesBlock->stateDecls) {
+        MachineDecl *m = mi->decl;
+        if (m->sharedBlock)
+            for (auto &v : m->sharedBlock->varDecls) declareShared(*v);
+        if (m->statesBlock)
+            for (auto &sd : m->statesBlock->stateDecls) {
                 stateOrder.push_back(sd->name);
                 stateByName[sd->name] = sd.get();
             }
+        if (stateOrder.empty())
+            throw SimError("machine '" + mi->decl->name + "' has no states");
+        state = stateOrder.front();
+    }
+
+    // Runs one cycle. Returns true if anything observable happened (body ran
+    // or state changed) — used for idle detection.
+    bool cycle() {
+        next = committed;
+        nextState = state;
+        localBindings.clear();
+        forDepth = 0;
+
+        StateDecl *sd = stateByName.at(state);
+
+        // Header receives gate the body: all channels must have data.
+        std::vector<std::pair<std::string, ChanQueue *>> recvs;
+        for (auto &h : sd->headerReceives) {
+            std::string var, chan;
+            if (!headerBinding(h.get(), var, chan))
+                throw SimError("unsupported state header in machine '" +
+                               mi->decl->name + "'");
+            auto it = inQ.find(chan);
+            if (it == inQ.end())
+                throw SimError("state header receives from '" + chan +
+                               "' which is not an input of machine '" +
+                               mi->decl->name + "'");
+            if (!it->second->hasData())
+                return false;   // stall: body does not run this cycle
+            recvs.push_back({var, it->second});
+        }
+        for (auto &[var, qq] : recvs)
+            localBindings[var] = qq->pop();
+
+        if (sd->body)
+            for (auto &s : sd->body->statements) exec(s.get());
+        return true;
+    }
+
+    void commit() {
+        committed = next;
+        state = nextState;
+    }
+
+private:
+    bool headerBinding(BinaryStmt *h, std::string &var, std::string &chan) {
+        auto identOf = [](Expr *e, std::string &out_) {
+            if (e && e->getKind() == ASTNodeKind::IdentExpr) {
+                out_ = static_cast<IdentExpr *>(e)->name;
+                return true;
+            }
+            return false;
+        };
+        if (h->op == "<-")   // x <- ch
+            return identOf(h->lhs.get(), var) && identOf(h->rhs.get(), chan);
+        if (h->op == "->")   // ch -> x
+            return identOf(h->lhs.get(), chan) && identOf(h->rhs.get(), var);
+        return false;
     }
 
     void declareShared(VarDecl &v) {
@@ -170,9 +232,8 @@ private:
         return k;
     }
 
-    // ── reads ────────────────────────────────────────────────────────────────
-    // Mirrors readVar(): inside a for-loop return the pending (this-cycle) value
-    // so unrolled accumulations work; otherwise return the committed value.
+    // Mirrors readVar(): inside a for-loop, reads see this cycle's pending
+    // writes; otherwise the start-of-cycle value.
     uint64_t readKey(const std::string &key) {
         if (forDepth > 0) {
             auto it = next.find(key);
@@ -182,7 +243,6 @@ private:
         return it == committed.end() ? 0 : it->second;
     }
 
-    // Resolve base name + concrete index values of an a[i][j] chain.
     bool indexChain(Expr *e, std::string &name, std::vector<int64_t> &idx) {
         std::vector<Expr *> ixs;
         while (e && e->getKind() == ASTNodeKind::IndexExpr) {
@@ -211,6 +271,7 @@ private:
         case ASTNodeKind::IdentExpr: {
             std::string n = static_cast<IdentExpr *>(e)->name;
             if (loopConsts.count(n)) return (uint64_t)loopConsts[n];
+            if (localBindings.count(n)) return localBindings[n];
             return readKey(n);
         }
         case ASTNodeKind::IndexExpr: {
@@ -218,7 +279,7 @@ private:
             std::vector<int64_t> idx;
             if (!indexChain(e, name, idx) || !arrays.count(name))
                 throw SimError("bad array access");
-            if (!inBounds(name, idx)) return 0;   // dynamic OOB read = 0
+            if (!inBounds(name, idx)) return 0;
             return readKey(elemKey(name, idx));
         }
         case ASTNodeKind::UnaryExpr: {
@@ -252,18 +313,13 @@ private:
             if (o == "||") return (l || r) ? 1 : 0;
             throw SimError("binary '" + o + "' not modelled");
         }
-        case ASTNodeKind::UpdateExpr: {
-            // value of x++ is x; the write is applied by execUpdate
-            auto *u = static_cast<UpdateExpr *>(e);
-            return eval(u->expr.get());
-        }
+        case ASTNodeKind::UpdateExpr:
+            return eval(static_cast<UpdateExpr *>(e)->expr.get());
         default:
             throw SimError("expression kind not modelled");
         }
     }
 
-    // Compile-time evaluation for loop bounds/updates. Registers are rejected
-    // exactly like the real compiler rejects runtime for-bounds.
     int64_t evalConst(Expr *e) {
         switch (e->getKind()) {
         case ASTNodeKind::NumberLiteral:
@@ -306,7 +362,6 @@ private:
         }
     }
 
-    // ── writes ─────────────────────────────────────────────────────────────
     void writeScalar(const std::string &name, const std::string &op,
                      uint64_t rhs) {
         int w = width.count(name) ? width[name] : 32;
@@ -319,7 +374,7 @@ private:
         std::vector<int64_t> idx;
         if (!indexChain(lhs, name, idx) || !arrays.count(name))
             throw SimError("bad array write target");
-        if (!inBounds(name, idx)) return;         // dynamic OOB write = nop
+        if (!inBounds(name, idx)) return;
         std::string key = elemKey(name, idx);
         int w = arrayElemWidth[name];
         uint64_t cur = readKey(key);
@@ -341,14 +396,13 @@ private:
         return rhs;
     }
 
-    // ── statements ───────────────────────────────────────────────────────────
     void exec(Stmt *s) {
         switch (s->getKind()) {
         case ASTNodeKind::BlockStmt:
-            for (auto &st : static_cast<BlockStmt *>(s)->statements) exec(st.get());
+            for (auto &st : static_cast<BlockStmt *>(s)->statements)
+                exec(st.get());
             return;
         case ASTNodeKind::VarDeclStmt: {
-            // A local var becomes a register too; only meaningful if later read.
             auto vd = static_cast<VarDeclStmt *>(s)->varDecl;
             if (vd->typedIdent.type.kind != TypeKind::ARRAY) {
                 int w = typeWidth(vd->typedIdent.type);
@@ -362,12 +416,31 @@ private:
         }
         case ASTNodeKind::BinaryStmt: {
             auto *b = static_cast<BinaryStmt *>(s);
-            if (b->op == "<-" || b->op == "->") return;   // channels: not modelled
+            if (b->op == "<-" || b->op == "->") {
+                // Output send: `out <- expr` or `expr -> out`.
+                bool rev = (b->op == "->");
+                Expr *dstE = rev ? b->rhs.get() : b->lhs.get();
+                Expr *srcE = rev ? b->lhs.get() : b->rhs.get();
+                if (dstE->getKind() == ASTNodeKind::IdentExpr) {
+                    std::string port =
+                        static_cast<IdentExpr *>(dstE)->name;
+                    if (mi->outputs.count(port)) {
+                        uint64_t v = eval(srcE);
+                        auto it = outW.find(port);
+                        if (it != outW.end())
+                            it->second->staged.push_back(v);
+                        // unconnected outputs: value goes nowhere (as in HW)
+                        return;
+                    }
+                }
+                return;   // other channel forms in bodies: not modelled
+            }
             uint64_t rhs = eval(b->rhs.get());
             if (b->lhs->getKind() == ASTNodeKind::IndexExpr)
                 writeElem(b->lhs.get(), b->op, rhs);
             else if (b->lhs->getKind() == ASTNodeKind::IdentExpr)
-                writeScalar(static_cast<IdentExpr *>(b->lhs.get())->name, b->op, rhs);
+                writeScalar(static_cast<IdentExpr *>(b->lhs.get())->name,
+                            b->op, rhs);
             return;
         }
         case ASTNodeKind::ExprStmt: {
@@ -378,9 +451,15 @@ private:
                 execCall(static_cast<CallExpr *>(e));
             return;
         }
-        case ASTNodeKind::IfStmt:
-            execIf(static_cast<IfStmt *>(s));
+        case ASTNodeKind::IfStmt: {
+            auto *i = static_cast<IfStmt *>(s);
+            if (eval(i->cond.get())) {
+                if (i->thenBranch) exec(i->thenBranch.get());
+            } else if (i->elseBranch) {
+                exec(i->elseBranch.get());
+            }
             return;
+        }
         case ASTNodeKind::ForStmt:
             execFor(static_cast<ForStmt *>(s));
             return;
@@ -388,7 +467,7 @@ private:
             nextState = static_cast<GotoStmt *>(s)->targetState;
             return;
         default:
-            return;   // switch/return etc. — not used by the array/loop examples
+            return;
         }
     }
 
@@ -400,18 +479,9 @@ private:
             writeScalar(static_cast<IdentExpr *>(u->expr.get())->name, op, 1);
     }
 
-    void execIf(IfStmt *s) {
-        if (eval(s->cond.get())) {
-            if (s->thenBranch) exec(s->thenBranch.get());
-        } else if (s->elseBranch) {
-            exec(s->elseBranch.get());
-        }
-    }
-
     void execFor(ForStmt *s) {
         std::string var;
         int64_t cur = 0;
-        // init
         if (s->init && s->init->getKind() == ASTNodeKind::VarDeclStmt) {
             auto vd = static_cast<VarDeclStmt *>(s->init.get())->varDecl;
             var = vd->typedIdent.idents.empty() ? "" : vd->typedIdent.idents[0];
@@ -430,7 +500,8 @@ private:
         ++forDepth;
         int guard = 0;
         while (true) {
-            if (++guard > 1000000) throw SimError("for-loop exceeded 1e6 unrolls");
+            if (++guard > 1000000)
+                throw SimError("for-loop exceeded 1e6 unrolls");
             loopConsts[var] = cur;
             if (s->cond && !evalConst(s->cond.get())) break;
             if (!s->cond) throw SimError("for-loop needs a bound");
@@ -440,7 +511,6 @@ private:
         --forDepth;
 
         if (hadOuter) loopConsts[var] = outer; else loopConsts.erase(var);
-        // If the loop variable is a shared register, commit its final value.
         if (width.count(var))
             next[var] = maskWidth((uint64_t)cur, width[var]);
     }
@@ -477,15 +547,171 @@ private:
             else
                 line += std::to_string(eval(a.get()));
         }
-        out.push_back(line);
+        out->push_back(line);
     }
+};
+
+class Sim {
+public:
+    void build(Program *prog) {
+        InstantiateDecl *instBlock = nullptr;
+        for (auto &d : prog->decls) {
+            if (!d) continue;
+            if (d->getKind() == ASTNodeKind::MachineDecl) {
+                auto *m = static_cast<MachineDecl *>(d.get());
+                MachineInfo &info = machines[m->name];
+                info.decl = m;
+                if (m->interfaceBlock)
+                    for (auto &io : m->interfaceBlock->ioDecls)
+                        for (auto &id : io.idents)
+                            (io.direction == "input" ? info.inputs
+                                                     : info.outputs)
+                                .insert(id);
+            } else if (d->getKind() == ASTNodeKind::InstantiateDecl) {
+                instBlock = static_cast<InstantiateDecl *>(d.get());
+            }
+        }
+        if (!instBlock || !instBlock->body)
+            throw SimError("no instantiate block found");
+
+        // First pass: create instances.
+        for (auto &s : instBlock->body->statements) {
+            if (s->getKind() != ASTNodeKind::InstModuleStmt) continue;
+            auto *im = static_cast<InstModuleStmt *>(s.get());
+            auto mIt = machines.find(im->callExpr->funcName);
+            if (mIt == machines.end())
+                throw SimError("machine '" + im->callExpr->funcName +
+                               "' not found for instantiation");
+            auto inst = std::make_unique<Inst>();
+            inst->name = im->varName;
+            inst->mi = &mIt->second;
+            inst->out = &out;
+            inst->setup();
+            // one queue per input port (unfed = never valid)
+            for (auto &p : mIt->second.inputs) {
+                queues.push_back(std::make_unique<ChanQueue>());
+                inst->inQ[p] = queues.back().get();
+            }
+            byName[im->varName] = inst.get();
+            insts.push_back(std::move(inst));
+        }
+
+        // Second pass: wires and constant feeds.
+        for (auto &s : instBlock->body->statements) {
+            if (s->getKind() != ASTNodeKind::BinaryStmt) continue;
+            auto *b = static_cast<BinaryStmt *>(s.get());
+            if (b->op != "<-" && b->op != "->") continue;
+            bool rev = (b->op == "->");
+            Expr *dstE = rev ? b->rhs.get() : b->lhs.get();
+            Expr *srcE = rev ? b->lhs.get() : b->rhs.get();
+
+            if (dstE->getKind() != ASTNodeKind::FieldExpr)
+                throw SimError("instantiate feeds must target <inst>.<port>");
+            auto *df = static_cast<FieldExpr *>(dstE);
+            Inst *dst = byName.count(df->object) ? byName[df->object] : nullptr;
+            if (!dst)
+                throw SimError("unknown instance '" + df->object + "'");
+            auto qIt = dst->inQ.find(df->field);
+            if (qIt == dst->inQ.end())
+                throw SimError("instance '" + df->object +
+                               "' has no input channel '" + df->field + "'");
+            ChanQueue *q = qIt->second;
+            if (q->driven)
+                throw SimError("input '" + df->object + "." + df->field +
+                               "' is already driven");
+
+            if (srcE->getKind() == ASTNodeKind::FieldExpr) {
+                auto *sf = static_cast<FieldExpr *>(srcE);
+                Inst *src =
+                    byName.count(sf->object) ? byName[sf->object] : nullptr;
+                if (!src)
+                    throw SimError("unknown instance '" + sf->object + "'");
+                if (!src->mi->outputs.count(sf->field))
+                    throw SimError("instance '" + sf->object +
+                                   "' has no output channel '" + sf->field +
+                                   "'");
+                if (src->outW.count(sf->field))
+                    throw SimError("output '" + sf->object + "." + sf->field +
+                                   "' is already connected (channels are "
+                                   "point-to-point)");
+                src->outW[sf->field] = q;
+                q->driven = true;
+            } else if (srcE->getKind() == ASTNodeKind::NumberLiteral ||
+                       srcE->getKind() == ASTNodeKind::UnaryExpr) {
+                // constant feed → always-valid stream
+                int64_t v = constOf(srcE);
+                q->isConst = true;
+                q->constVal = (uint64_t)v;
+                q->driven = true;
+            } else {
+                throw SimError(
+                    "instantiate feed must be a literal or <inst>.<port> "
+                    "(enums are not modelled by cast_sim)");
+            }
+        }
+        if (insts.empty()) throw SimError("no instances created");
+    }
+
+    void run(int maxCycles, bool trace) {
+        int idle = 0;
+        for (int cycle = 0; cycle < maxCycles; ++cycle) {
+            size_t outBefore = out.size();
+            if (trace) {
+                std::string line = "--- cycle " + std::to_string(cycle) + " :";
+                for (auto &i : insts) line += " " + i->name + "=" + i->state;
+                out.push_back(line + " ---");
+            }
+
+            bool anyActive = false;
+            for (auto &i : insts)
+                if (i->cycle()) anyActive = true;
+
+            bool queuesMoving = false;
+            for (auto &q : queues) {
+                if (!q->staged.empty()) queuesMoving = true;
+                q->commit();
+            }
+            bool stateChanged = false, regsChanged = false;
+            for (auto &i : insts) {
+                if (i->nextState != i->state) stateChanged = true;
+                if (i->next != i->committed) regsChanged = true;
+                i->commit();
+            }
+            bool printed = out.size() > outBefore + (trace ? 1 : 0);
+            (void)anyActive;
+
+            if (!printed && !stateChanged && !regsChanged && !queuesMoving) {
+                if (++idle >= 2) break;   // whole system is quiescent
+            } else {
+                idle = 0;
+            }
+        }
+        for (auto &line : out) std::cout << line << "\n";
+    }
+
+private:
+    static int64_t constOf(Expr *e) {
+        if (e->getKind() == ASTNodeKind::NumberLiteral)
+            return static_cast<NumberLiteral *>(e)->value;
+        if (e->getKind() == ASTNodeKind::UnaryExpr) {
+            auto *u = static_cast<UnaryExpr *>(e);
+            if (u->op == "-") return -constOf(u->expr.get());
+        }
+        throw SimError("unsupported constant feed expression");
+    }
+
+    std::map<std::string, MachineInfo> machines;
+    std::vector<std::unique_ptr<Inst>> insts;
+    std::map<std::string, Inst *> byName;
+    std::vector<std::unique_ptr<ChanQueue>> queues;
+    std::vector<std::string> out;
 };
 
 } // namespace
 
 int main(int argc, char **argv) {
     std::string file;
-    int maxCycles = 200;
+    int maxCycles = 300;
     bool trace = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -505,14 +731,8 @@ int main(int argc, char **argv) {
     try {
         CastParser parser(ss.str());
         auto prog = parser.parseProgram();
-        MachineDecl *machine = nullptr;
-        for (auto &d : prog->decls)
-            if (d && d->getKind() == ASTNodeKind::MachineDecl) {
-                machine = static_cast<MachineDecl *>(d.get());
-                break;
-            }
-        if (!machine) { std::cerr << "no machine found\n"; return 1; }
-        Sim sim(machine);
+        Sim sim;
+        sim.build(prog.get());
         sim.run(maxCycles, trace);
         return 0;
     } catch (const std::exception &e) {
