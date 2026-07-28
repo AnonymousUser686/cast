@@ -100,6 +100,17 @@ ninja
 
 The build produces a single binary: `build/castc`.
 
+### Prebuilt binary via GitHub Actions (no LLVM build needed)
+
+The `build castc` workflow (`.github/workflows/build-castc.yml`) builds a
+Linux x86_64 `castc` against the prebuilt `circt-full-static` release package
+instead of a from-source LLVM/CIRCT build, then runs the full example suite
+with iverilog. Trigger it from the Actions tab and download the
+`castc-linux-x64` artifact from the run page; place the binary at
+`<repo>/build/castc` on the target machine and `simulate.sh` works as-is.
+Useful when the target machine (or your workstation) cannot host the ~50 GB
+LLVM + CIRCT source build.
+
 ---
 
 ## Quick start
