@@ -52,6 +52,25 @@ jobs:
           tar -xzf circt.tar.gz --strip-components=1 -C circt-install
           echo "CIRCT_PREFIX=$PWD/circt-install" >> "$GITHUB_ENV"
 
+      # The exported LLVM targets record absolute paths to the system zlib/zstd
+      # *shared* objects as they existed on the CIRCT build machine. Those
+      # hardcoded .so paths defeat -static regardless of CMAKE_FIND_LIBRARY_
+      # SUFFIXES, so rewrite them to the .a next door (both ship in the -dev
+      # packages installed above).
+      - name: Point exported cmake targets at static system libs
+        run: |
+          for lib in libz libzstd; do
+            a="/usr/lib/x86_64-linux-gnu/$lib.a"
+            [ -f "$a" ] || { echo "note: $a not present, skipping"; continue; }
+            hits=$(grep -rl "$lib\.so" "$CIRCT_PREFIX/lib/cmake" || true)
+            if [ -n "$hits" ]; then
+              echo "rewriting $lib.so -> $lib.a in:"; echo "$hits"
+              echo "$hits" | xargs sed -i "s#/usr/lib/x86_64-linux-gnu/$lib\.so[0-9.]*#$a#g"
+            fi
+          done
+          grep -rhoE '/usr/lib/x86_64-linux-gnu/lib(z|zstd)\.[a-z.0-9]+' \
+            "$CIRCT_PREFIX/lib/cmake" | sort -u || true
+
       - name: Verify cmake packages are present
         run: |
           echo "prefix contents:"; ls "$CIRCT_PREFIX"
@@ -80,20 +99,25 @@ jobs:
           # Prefer .a when resolving system deps (zlib/zstd) so -static works.
           if cmake -S . -B build "${common[@]}" \
                  -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
-                 -DCMAKE_EXE_LINKER_FLAGS="-static" > configure.log 2>&1 \
-             && ninja -C build castc > build.log 2>&1; then
+                 -DZLIB_USE_STATIC_LIBS=ON \
+                 -DCMAKE_EXE_LINKER_FLAGS="-static" \
+                 > configure-static.log 2>&1 \
+             && ninja -C build castc > build-static.log 2>&1; then
             echo "link mode: STATIC (portable across glibc versions)"
             echo "LINK_MODE=static" >> "$GITHUB_ENV"
+            cp configure-static.log configure.log; cp build-static.log build.log
           else
-            echo "static link did not succeed; last lines were:"
-            tail -25 build.log 2>/dev/null || tail -25 configure.log 2>/dev/null || true
+            echo "static link did not succeed. Reason (last 40 lines):"
+            tail -40 build-static.log 2>/dev/null || true
+            echo "--- configure tail ---"
+            tail -20 configure-static.log 2>/dev/null || true
             echo "=== attempt 2: dynamic link ==="
             rm -rf build
             cmake -S . -B build "${common[@]}" \
               -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
               > configure.log 2>&1
             ninja -C build castc > build.log 2>&1
-            echo "link mode: DYNAMIC (needs glibc >= runner's on the target)"
+            echo "link mode: DYNAMIC (will NOT run on targets with older glibc)"
             echo "LINK_MODE=dynamic" >> "$GITHUB_ENV"
           fi
 
@@ -129,6 +153,35 @@ jobs:
         id: check
         continue-on-error: true
         run: ninja -C build check
+
+      # Escape hatch for targets that cannot run the binary (e.g. older glibc):
+      # ship the generated SystemVerilog instead. iverilog + vvp on the node
+      # need no castc at all.
+      - name: Compile every example to SystemVerilog
+        if: always()
+        continue-on-error: true
+        run: |
+          [ -x build/castc ] || { echo "no castc, skipping"; exit 0; }
+          mkdir -p sv-out
+          for f in examples/*.cast; do
+            n=$(basename "$f" .cast)
+            if ./build/castc --tb --duration=2000 "$f" > "sv-out/$n.sv" 2>"/tmp/$n.err"; then
+              echo "ok   $n"
+            else
+              echo "skip $n  ($(head -1 "/tmp/$n.err"))"
+              rm -f "sv-out/$n.sv"
+            fi
+          done
+          echo "--- generated ---"; ls -1 sv-out
+
+      - name: Upload generated SystemVerilog
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-verilog
+          path: sv-out
+          if-no-files-found: ignore
 
       - name: Prepare binary
         if: always()
