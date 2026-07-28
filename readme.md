@@ -22,6 +22,12 @@ cast source (.cast)
   iverilog / synthesis tool
 ```
 
+> **New here, or working on the COSMOS nodes?** Start with
+> [GETTING_STARTED.md](GETTING_STARTED.md) — it gets you a prebuilt compiler,
+> onto a node, and running programs without building LLVM/CIRCT, and lists the
+> behaviours that most often trip people up. This document is the language and
+> compiler reference.
+
 ## Table of contents
 
 1. [Prerequisites](#prerequisites)
