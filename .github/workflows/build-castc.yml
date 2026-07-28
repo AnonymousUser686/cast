@@ -1,0 +1,83 @@
+# Builds a Linux x86_64 `castc` binary and runs the full example test suite.
+#
+# Instead of building LLVM + MLIR + CIRCT from source (the readme flow: hours
+# and ~50 GB), this uses the prebuilt `circt-full-static-linux-x64` package
+# from the CIRCT release nearest the commit the readme pins:
+#   readme pins CIRCT 7f76cbc26 (2026-03-19); firtool-1.143.0 was tagged
+#   2026-03-23, four days later.
+#
+# Trigger it from the GitHub UI (Actions tab -> "build castc" -> Run
+# workflow), or it runs automatically on pushes that touch the compiler.
+# The finished binary appears as the `castc-linux-x64` artifact on the run
+# page; scp it onto a node as <repo>/build/castc and simulate.sh works as-is.
+
+name: build castc
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "examples/**"
+      - "tests/**"
+      - ".github/workflows/build-castc.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and simulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang iverilog zlib1g-dev libzstd-dev
+
+      - name: Download prebuilt CIRCT (firtool-1.143.0, static Linux libs)
+        run: |
+          curl -L --retry 3 -o circt.tar.gz \
+            https://github.com/llvm/circt/releases/download/firtool-1.143.0/circt-full-static-linux-x64.tar.gz
+          mkdir circt-install
+          tar -xzf circt.tar.gz -C circt-install
+          CFG=$(find "$PWD/circt-install" -name CIRCTConfig.cmake | head -1)
+          if [ -z "$CFG" ]; then echo "CIRCTConfig.cmake not found in package"; exit 1; fi
+          # config lives at <prefix>/lib/cmake/circt/CIRCTConfig.cmake
+          PREFIX=$(dirname "$(dirname "$(dirname "$(dirname "$CFG")")")")
+          echo "CIRCT prefix: $PREFIX"
+          ls "$PREFIX"
+          echo "CIRCT_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$CIRCT_PREFIX" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+
+      - name: Build castc
+        run: ninja -C build castc
+
+      - name: Smoke test (compile an example to Verilog)
+        run: |
+          ./build/castc --tb examples/counter.cast > /tmp/counter.sv
+          head -20 /tmp/counter.sv
+          iverilog -g2012 -gno-assertions -o /tmp/counter_sim /tmp/counter.sv
+          timeout 30 vvp /tmp/counter_sim | head -15
+
+      - name: Run full example suite (ninja check)
+        run: ninja -C build check
+
+      - name: Strip binary
+        if: always()
+        run: |
+          strip build/castc || true
+          ls -lh build/castc
+
+      - name: Upload castc artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: castc-linux-x64
+          path: build/castc
+          if-no-files-found: error
