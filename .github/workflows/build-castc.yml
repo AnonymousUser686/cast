@@ -5,13 +5,19 @@
 # from the CIRCT release nearest the commit the readme pins:
 #   readme pins CIRCT 7f76cbc26 (2026-03-19); firtool-1.143.0 was tagged
 #   2026-03-23, four days later.
-# That package unpacks to a standard prefix (bin/ include/ lib/ share/) and
-# ships static libs plus the LLVM, MLIR and CIRCT cmake configs.
+#
+# Runner must be ubuntu-24.04: that prebuilt package references glibc 2.38+
+# symbols (__isoc23_strtoll, arc4random), so linking on 22.04 fails.
+#
+# Because the runner's glibc is newer than some deployment targets (e.g. the
+# ORBIT node images), the job first tries a fully static link so the binary
+# carries its own libc and runs anywhere, falling back to a dynamic link if
+# that is not possible. Check the "link mode" output to see which you got.
 #
 # Trigger from the Actions tab ("build castc" -> Run workflow). The binary is
 # uploaded as the `castc-linux-x64` artifact; scp it onto a node as
-# <repo>/build/castc and simulate.sh works as-is. On failure a `build-logs`
-# artifact holds the full configure/build output.
+# <repo>/build/castc and simulate.sh works as-is. A `build-logs` artifact
+# holds the full configure/build output.
 
 name: build castc
 
@@ -27,7 +33,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -38,13 +44,11 @@ jobs:
 
       - name: Download and unpack prebuilt CIRCT (firtool-1.143.0)
         run: |
-          set -x
           curl -L --retry 3 -o circt.tar.gz \
             https://github.com/llvm/circt/releases/download/firtool-1.143.0/circt-full-static-linux-x64.tar.gz
           ls -lh circt.tar.gz
           mkdir -p circt-install
-          # The tarball has a single top-level dir; strip it so we get a
-          # plain prefix at circt-install/{bin,include,lib,share}.
+          # Tarball has a single top-level dir; strip it to get a plain prefix.
           tar -xzf circt.tar.gz --strip-components=1 -C circt-install
           echo "CIRCT_PREFIX=$PWD/circt-install" >> "$GITHUB_ENV"
 
@@ -61,30 +65,57 @@ jobs:
             echo "found $d"
           done
 
-      - name: Configure
-        id: configure
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$CIRCT_PREFIX" \
-            -DLLVM_DIR="$CIRCT_PREFIX/lib/cmake/llvm" \
-            -DMLIR_DIR="$CIRCT_PREFIX/lib/cmake/mlir" \
-            -DCIRCT_DIR="$CIRCT_PREFIX/lib/cmake/circt" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
-            2>&1 | tee configure.log
-          exit "${PIPESTATUS[0]}"
-
-      - name: Build castc
+      - name: Configure and build castc (static preferred)
         id: compile
         run: |
-          ninja -C build castc 2>&1 | tee build.log
-          exit "${PIPESTATUS[0]}"
+          common=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_PREFIX_PATH=$CIRCT_PREFIX
+            -DLLVM_DIR=$CIRCT_PREFIX/lib/cmake/llvm
+            -DMLIR_DIR=$CIRCT_PREFIX/lib/cmake/mlir
+            -DCIRCT_DIR=$CIRCT_PREFIX/lib/cmake/circt
+          )
+          echo "=== attempt 1: fully static link ==="
+          # Prefer .a when resolving system deps (zlib/zstd) so -static works.
+          if cmake -S . -B build "${common[@]}" \
+                 -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+                 -DCMAKE_EXE_LINKER_FLAGS="-static" > configure.log 2>&1 \
+             && ninja -C build castc > build.log 2>&1; then
+            echo "link mode: STATIC (portable across glibc versions)"
+            echo "LINK_MODE=static" >> "$GITHUB_ENV"
+          else
+            echo "static link did not succeed; last lines were:"
+            tail -25 build.log 2>/dev/null || tail -25 configure.log 2>/dev/null || true
+            echo "=== attempt 2: dynamic link ==="
+            rm -rf build
+            cmake -S . -B build "${common[@]}" \
+              -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+              > configure.log 2>&1
+            ninja -C build castc > build.log 2>&1
+            echo "link mode: DYNAMIC (needs glibc >= runner's on the target)"
+            echo "LINK_MODE=dynamic" >> "$GITHUB_ENV"
+          fi
 
-      - name: Show first compile errors
+      - name: Show compile/link errors
         if: failure() && steps.compile.outcome == 'failure'
         run: |
-          echo "=== first errors ==="
-          grep -nE 'error:' build.log | head -40 || echo "(no 'error:' lines found)"
+          echo "=== errors ==="
+          grep -nE 'error:|undefined reference' build.log | head -40 || true
+          echo "=== build.log tail ==="
+          tail -60 build.log 2>/dev/null || true
+          echo "=== configure.log tail ==="
+          tail -40 configure.log 2>/dev/null || true
+
+      - name: Report binary portability
+        run: |
+          file build/castc
+          echo "link mode: $LINK_MODE"
+          echo "--- dynamic deps (none if static) ---"
+          ldd build/castc || true
+          echo "--- max glibc symbol version required ---"
+          objdump -T build/castc 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3 \
+            || echo "(static: no versioned glibc imports)"
 
       - name: Smoke test (compile an example to Verilog)
         run: |
@@ -93,8 +124,7 @@ jobs:
           iverilog -g2012 -gno-assertions -o /tmp/counter_sim /tmp/counter.sv
           timeout 30 vvp /tmp/counter_sim | head -15
 
-      # Runs the whole example suite. Kept non-fatal so that a behavioural
-      # test failure still yields a downloadable binary to debug with.
+      # Non-fatal: a behavioural test failure should still yield a binary.
       - name: Run full example suite (ninja check)
         id: check
         continue-on-error: true
@@ -106,7 +136,6 @@ jobs:
           if [ -f build/castc ]; then
             strip build/castc || true
             ls -lh build/castc
-            file build/castc
           else
             echo "::warning::build/castc was not produced"
           fi
