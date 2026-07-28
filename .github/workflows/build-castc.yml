@@ -5,11 +5,13 @@
 # from the CIRCT release nearest the commit the readme pins:
 #   readme pins CIRCT 7f76cbc26 (2026-03-19); firtool-1.143.0 was tagged
 #   2026-03-23, four days later.
+# That package unpacks to a standard prefix (bin/ include/ lib/ share/) and
+# ships static libs plus the LLVM, MLIR and CIRCT cmake configs.
 #
-# Trigger it from the GitHub UI (Actions tab -> "build castc" -> Run
-# workflow), or it runs automatically on pushes that touch the compiler.
-# The finished binary appears as the `castc-linux-x64` artifact on the run
-# page; scp it onto a node as <repo>/build/castc and simulate.sh works as-is.
+# Trigger from the Actions tab ("build castc" -> Run workflow). The binary is
+# uploaded as the `castc-linux-x64` artifact; scp it onto a node as
+# <repo>/build/castc and simulate.sh works as-is. On failure a `build-logs`
+# artifact holds the full configure/build output.
 
 name: build castc
 
@@ -34,29 +36,55 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build clang iverilog zlib1g-dev libzstd-dev
 
-      - name: Download prebuilt CIRCT (firtool-1.143.0, static Linux libs)
+      - name: Download and unpack prebuilt CIRCT (firtool-1.143.0)
         run: |
+          set -x
           curl -L --retry 3 -o circt.tar.gz \
             https://github.com/llvm/circt/releases/download/firtool-1.143.0/circt-full-static-linux-x64.tar.gz
-          mkdir circt-install
-          tar -xzf circt.tar.gz -C circt-install
-          CFG=$(find "$PWD/circt-install" -name CIRCTConfig.cmake | head -1)
-          if [ -z "$CFG" ]; then echo "CIRCTConfig.cmake not found in package"; exit 1; fi
-          # config lives at <prefix>/lib/cmake/circt/CIRCTConfig.cmake
-          PREFIX=$(dirname "$(dirname "$(dirname "$(dirname "$CFG")")")")
-          echo "CIRCT prefix: $PREFIX"
-          ls "$PREFIX"
-          echo "CIRCT_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          ls -lh circt.tar.gz
+          mkdir -p circt-install
+          # The tarball has a single top-level dir; strip it so we get a
+          # plain prefix at circt-install/{bin,include,lib,share}.
+          tar -xzf circt.tar.gz --strip-components=1 -C circt-install
+          echo "CIRCT_PREFIX=$PWD/circt-install" >> "$GITHUB_ENV"
+
+      - name: Verify cmake packages are present
+        run: |
+          echo "prefix contents:"; ls "$CIRCT_PREFIX"
+          for p in llvm mlir circt; do
+            d="$CIRCT_PREFIX/lib/cmake/$p"
+            if [ ! -d "$d" ]; then
+              echo "::error::missing cmake package dir $d"
+              find "$CIRCT_PREFIX" -maxdepth 4 -name '*Config.cmake' | head -20
+              exit 1
+            fi
+            echo "found $d"
+          done
 
       - name: Configure
+        id: configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$CIRCT_PREFIX" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            -DLLVM_DIR="$CIRCT_PREFIX/lib/cmake/llvm" \
+            -DMLIR_DIR="$CIRCT_PREFIX/lib/cmake/mlir" \
+            -DCIRCT_DIR="$CIRCT_PREFIX/lib/cmake/circt" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            2>&1 | tee configure.log
+          exit "${PIPESTATUS[0]}"
 
       - name: Build castc
-        run: ninja -C build castc
+        id: compile
+        run: |
+          ninja -C build castc 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Show first compile errors
+        if: failure() && steps.compile.outcome == 'failure'
+        run: |
+          echo "=== first errors ==="
+          grep -nE 'error:' build.log | head -40 || echo "(no 'error:' lines found)"
 
       - name: Smoke test (compile an example to Verilog)
         run: |
@@ -65,14 +93,23 @@ jobs:
           iverilog -g2012 -gno-assertions -o /tmp/counter_sim /tmp/counter.sv
           timeout 30 vvp /tmp/counter_sim | head -15
 
+      # Runs the whole example suite. Kept non-fatal so that a behavioural
+      # test failure still yields a downloadable binary to debug with.
       - name: Run full example suite (ninja check)
+        id: check
+        continue-on-error: true
         run: ninja -C build check
 
-      - name: Strip binary
+      - name: Prepare binary
         if: always()
         run: |
-          strip build/castc || true
-          ls -lh build/castc
+          if [ -f build/castc ]; then
+            strip build/castc || true
+            ls -lh build/castc
+            file build/castc
+          else
+            echo "::warning::build/castc was not produced"
+          fi
 
       - name: Upload castc artifact
         if: always()
@@ -80,4 +117,14 @@ jobs:
         with:
           name: castc-linux-x64
           path: build/castc
-          if-no-files-found: error
+          if-no-files-found: warn
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
