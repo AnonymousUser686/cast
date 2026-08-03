@@ -1,0 +1,6 @@
+# Reference outputs are compared with `diff` against simulator output on
+# Linux nodes. Keep them LF so a Windows checkout does not turn every line
+# into a spurious difference.
+*.expected text eol=lf
+*.cast     text eol=lf
+simulate.sh text eol=lf
