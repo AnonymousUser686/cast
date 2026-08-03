@@ -144,7 +144,9 @@ machine MnistTile {{
                 f"e_{i + 1}_0" if i + 1 < N else "halt")
             add(f"""\
         e_{i}_{j}: {{
-            if (c[{i}][{j}] >= 2147483648) {{
+            // `< 0` is an unsigned compare and would never fire, so test the
+            // sign bit. >> is logical, which is exactly what is wanted here.
+            if ((c[{i}][{j}] >> 31) == 1) {{
                 print("  C[{i}][{j}] = -", 0 - c[{i}][{j}]);
             }} else {{
                 print("  C[{i}][{j}] = ", c[{i}][{j}]);

@@ -484,6 +484,9 @@ producer → doubler → printer chain.
 | [matrix_multiply.cast](examples/matrix_multiply.cast) | Intermediate | 2x2 matrix multiply with scalar registers and explicit dot products |
 | [matrix_multiply_loops.cast](examples/matrix_multiply_loops.cast) | Intermediate | 2x2 matrix multiply routed through unrolled loops |
 | [systolic_matmul.cast](examples/systolic_matmul.cast) | Advanced | 3x3 output-stationary systolic array: 9 parallel MAC PEs with skewed operand injection |
+| [signed_arithmetic.cast](examples/signed_arithmetic.cast) | Intermediate | What works and what does not on negative values, and the sign-bit idioms that work around it |
+| [mnist_tile.cast](examples/mnist_tile.cast) | Advanced | One 5x5 tile of a quantised MNIST layer, with signed weights, printed in sign-magnitude |
+| [mnist_mlp_hex.cast](examples/mnist_mlp_hex.cast) | Advanced | Full MNIST inference on a hexagonal systolic array — see [ml/README.md](ml/README.md) |
 
 Run any example:
 
