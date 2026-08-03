@@ -92,6 +92,7 @@ struct ChanQueue {
 struct MachineInfo {
     MachineDecl *decl = nullptr;
     std::set<std::string> inputs, outputs;
+    std::map<std::string, int> portWidth;   // channel data width, by port name
 };
 
 // One machine instance: its registers, state, and executor.
@@ -264,6 +265,54 @@ private:
         return true;
     }
 
+    // Width an expression's value carries, mirroring the lowering: literals
+    // default to 32 bits, names use their declared width, binary ops widen to
+    // the larger operand, comparisons yield 1 bit. Needed so that negative
+    // intermediates truncate the same way the hardware does -- otherwise
+    // `x == 0 - 15` compares a 64-bit -15 against a 32-bit one.
+    int exprWidth(Expr *e) {
+        switch (e->getKind()) {
+        case ASTNodeKind::NumberLiteral:
+            return 32;
+        case ASTNodeKind::IdentExpr: {
+            std::string n = static_cast<IdentExpr *>(e)->name;
+            if (loopConsts.count(n)) return 32;
+            if (localBindings.count(n)) {
+                auto p = mi->portWidth.find(n);
+                return p == mi->portWidth.end() ? 32 : p->second;
+            }
+            auto it = width.find(n);
+            return it == width.end() ? 32 : it->second;
+        }
+        case ASTNodeKind::IndexExpr: {
+            Expr *b = e;
+            while (b->getKind() == ASTNodeKind::IndexExpr)
+                b = static_cast<IndexExpr *>(b)->base.get();
+            if (b->getKind() == ASTNodeKind::IdentExpr) {
+                auto it =
+                    arrayElemWidth.find(static_cast<IdentExpr *>(b)->name);
+                if (it != arrayElemWidth.end()) return it->second;
+            }
+            return 32;
+        }
+        case ASTNodeKind::UnaryExpr:
+            return exprWidth(static_cast<UnaryExpr *>(e)->expr.get());
+        case ASTNodeKind::UpdateExpr:
+            return exprWidth(static_cast<UpdateExpr *>(e)->expr.get());
+        case ASTNodeKind::BinaryExpr: {
+            auto *b = static_cast<BinaryExpr *>(e);
+            const std::string &o = b->op;
+            if (o == "==" || o == "!=" || o == "<" || o == "<=" || o == ">" ||
+                o == ">=" || o == "&&" || o == "||")
+                return 1;
+            int lw = exprWidth(b->lhs.get()), rw = exprWidth(b->rhs.get());
+            return lw > rw ? lw : rw;
+        }
+        default:
+            return 32;
+        }
+    }
+
     uint64_t eval(Expr *e) {
         switch (e->getKind()) {
         case ASTNodeKind::NumberLiteral:
@@ -285,27 +334,33 @@ private:
         case ASTNodeKind::UnaryExpr: {
             auto *u = static_cast<UnaryExpr *>(e);
             uint64_t v = eval(u->expr.get());
-            if (u->op == "-") return (uint64_t)(-(int64_t)v);
+            int w = exprWidth(u->expr.get());
+            if (u->op == "-") return maskWidth((uint64_t)(-(int64_t)v), w);
             if (u->op == "!") return v == 0 ? 1 : 0;
             throw SimError("unary '" + u->op + "' not modelled");
         }
         case ASTNodeKind::BinaryExpr: {
             auto *b = static_cast<BinaryExpr *>(e);
-            uint64_t l = eval(b->lhs.get()), r = eval(b->rhs.get());
             const std::string &o = b->op;
-            if (o == "+") return l + r;
-            if (o == "-") return l - r;
-            if (o == "*") return l * r;
-            if (o == "/") return r ? l / r : 0;
-            if (o == "%") return r ? l % r : 0;
-            if (o == "&") return l & r;
-            if (o == "|") return l | r;
-            if (o == "^") return l ^ r;
-            if (o == "<<") return l << r;
-            if (o == ">>") return l >> r;
+            // Both operands are widened to the same width and every result is
+            // truncated to it, matching comb.* op semantics in the lowering.
+            int lw = exprWidth(b->lhs.get()), rw = exprWidth(b->rhs.get());
+            int w = lw > rw ? lw : rw;
+            uint64_t l = maskWidth(eval(b->lhs.get()), w);
+            uint64_t r = maskWidth(eval(b->rhs.get()), w);
+            if (o == "+") return maskWidth(l + r, w);
+            if (o == "-") return maskWidth(l - r, w);
+            if (o == "*") return maskWidth(l * r, w);
+            if (o == "/") return r ? maskWidth(l / r, w) : 0;
+            if (o == "%") return r ? maskWidth(l % r, w) : 0;
+            if (o == "&") return maskWidth(l & r, w);
+            if (o == "|") return maskWidth(l | r, w);
+            if (o == "^") return maskWidth(l ^ r, w);
+            if (o == "<<") return maskWidth(r >= 64 ? 0 : l << r, w);
+            if (o == ">>") return r >= 64 ? 0 : l >> r;   // logical, as ShrU
             if (o == "==") return l == r;
             if (o == "!=") return l != r;
-            if (o == "<") return l < r;
+            if (o == "<") return l < r;                   // unsigned, as ICmp ult
             if (o == "<=") return l <= r;
             if (o == ">") return l > r;
             if (o == ">=") return l >= r;
@@ -563,10 +618,12 @@ public:
                 info.decl = m;
                 if (m->interfaceBlock)
                     for (auto &io : m->interfaceBlock->ioDecls)
-                        for (auto &id : io.idents)
+                        for (auto &id : io.idents) {
                             (io.direction == "input" ? info.inputs
                                                      : info.outputs)
                                 .insert(id);
+                            info.portWidth[id] = typeWidth(io.typedIdent.type);
+                        }
             } else if (d->getKind() == ASTNodeKind::InstantiateDecl) {
                 instBlock = static_cast<InstantiateDecl *>(d.get());
             }

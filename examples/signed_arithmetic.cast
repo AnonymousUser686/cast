@@ -1,0 +1,59 @@
+// Does cast handle negative numbers? Equality works for both signs, so each
+// check prints OK/FAIL rather than relying on how negatives display.
+machine SignTest {
+    interface {}
+    shared {
+        var int32 a; var int32 b;
+        var int32 p1; var int32 p2; var int32 p3; var int32 acc;
+        var int32 mag;
+    }
+    states {
+        setup: {
+            a = 0 - 3;      // -3
+            b = 5;
+            goto mul;
+        }
+        mul: {
+            p1 = a * b;         // -3 * 5  = -15
+            p2 = a * a;         // -3 * -3 =  9
+            p3 = (0 - 7) * 6;   // -7 * 6  = -42
+            goto accum;
+        }
+        accum: {
+            acc = p1 + p2;      // -15 + 9 = -6
+            goto c1;
+        }
+        c1: {
+            if (p1 == 0 - 15) { print("neg * pos  OK"); } else { print("neg * pos  FAIL"); }
+            goto c2;
+        }
+        c2: {
+            if (p2 == 9) { print("neg * neg  OK"); } else { print("neg * neg  FAIL"); }
+            goto c3;
+        }
+        c3: {
+            if (p3 == 0 - 42) { print("unary minus OK"); } else { print("unary minus FAIL"); }
+            goto c4;
+        }
+        c4: {
+            if (acc == 0 - 6) { print("accumulate OK"); } else { print("accumulate FAIL"); }
+            goto c5;
+        }
+        c5: {
+            // Sign-magnitude printing: an unsigned compare against 2^31
+            // detects the sign bit, then 0-x recovers the magnitude.
+            if (p1 >= 2147483648) { mag = 0 - p1; } else { mag = p1; }
+            goto c6;
+        }
+        c6: {
+            if (p1 >= 2147483648) { print("p1 = -", mag); } else { print("p1 = ", mag); }
+            goto c7;
+        }
+        c7: {
+            print("raw p1 prints as: ", p1);
+            goto halt;
+        }
+        halt: { goto halt; }
+    }
+}
+instantiate { s = SignTest(); }
