@@ -37,3 +37,7 @@ ehthumbs.db
 # Locally-built helper tool binaries (build from tools/*.cpp as needed)
 tools/*.exe
 tools/cast_sim
+
+# Downloaded MNIST dataset (~64 MB); train_mnist_mlp.py re-fetches it.
+# The exported weights (ml/mnist_model.json) ARE committed.
+ml/data/
