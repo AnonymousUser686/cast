@@ -40,7 +40,8 @@ def gen(doc):
     w = doc["tile"]["w"]
     c = doc["tile"]["c"]
     k0 = doc["tile"]["feature_offset"]
-    labels = doc["reference"]["labels"]
+    # The tile demo uses only the first array-width of images.
+    labels = doc["reference"]["labels"][:N]
 
     L = []
     add = L.append

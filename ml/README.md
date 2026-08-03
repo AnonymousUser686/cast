@@ -31,8 +31,9 @@ Every dimension is a multiple of 5, the array's tile size.
 | accumulator | `int32` (peak 82664 — ample headroom) |
 | hidden requantise | `>> 9`, clamp to 255 |
 | weight registers | 700 |
-| array passes | 28 (20 for layer 1, 8 for layer 2) |
-| run length | 449 cycles |
+| images classified | 100, in 20 batches of 5 |
+| array passes | 28 per batch (20 for layer 1, 8 for layer 2); 560 total |
+| run length | 8583 cycles |
 
 Scaling up: `GRID = 10` in the training script reaches **94.6%**, at 2200
 weight registers and 88 passes. Raise it and regenerate if the larger design
@@ -93,28 +94,41 @@ Printing is affected too: `print` formats wires as unsigned, so
 See [../examples/signed_arithmetic.cast](../examples/signed_arithmetic.cast)
 for the minimal test of all this.
 
+## Batching
+
+The array is 5 wide in the image dimension, so **5 images go through
+together** — one pass computes a 5×5 block of (images × units). 100 images is
+20 such batches, run back to back through the same hardware.
+
+Only the pixels (2500 registers) and labels are stored per image. The
+accumulators are cleared and reused each batch, and the score is a single
+running counter rather than 100 stored predictions.
+
 ## Running
 
 ```bash
-./simulate.sh examples/mnist_mlp_hex.cast --duration=8000
+./simulate.sh examples/mnist_mlp_hex.cast --duration=100000
 ```
 
-Expected (20 hidden activations for image 0, then the five guesses):
+Expected — one line per image, then the score:
 
 ```
-MnistMLP: 5 images, 25 pixels -> 20 hidden -> 10 classes
-h[0] = 0
-h[1] = 12
+MnistMLP: 100 images, 25 pixels -> 20 hidden -> 10 classes
+image 0  label 7  guess 7  ok
+image 1  label 2  guess 2  ok
 ...
-image 0  label 7  guess 7
-image 1  label 2  guess 2
-image 2  label 1  guess 1
-image 3  label 0  guess 0
-image 4  label 4  guess 4
+image 99  label 9  guess 9  ok
+correct: 92 of 100
+accuracy: 92%
 ```
 
-Diff it against `tests/expected/mnist_mlp_hex.expected`. The run is 449
-cycles (4490 ns), so `--duration=8000` leaves room.
+92 of these particular 100 images is consistent with 89.78% over the full
+10,000-image test set. Since the run is exactly 100 images, the count *is* the
+percentage — no divider is synthesised.
+
+Diff it against `tests/expected/mnist_mlp_hex.expected`; all 103 lines,
+including which 8 images are wrong, come from PyTorch. The run is 8583
+cycles (85830 ns), so `--duration=100000` leaves room.
 
 `examples/mnist_tile.cast` is the smaller companion: one 5×5 layer-1 tile on
 the *square* array, printed in sign-magnitude. Useful to confirm signed
@@ -123,7 +137,7 @@ multiply on its own before running the whole network.
 Without a node, both check out under the behavioural simulator:
 
 ```bash
-tools/cast_sim --max-cycles=1000 examples/mnist_mlp_hex.cast
+tools/cast_sim --max-cycles=12000 examples/mnist_mlp_hex.cast
 tools/cast_sim examples/mnist_tile.cast
 ```
 

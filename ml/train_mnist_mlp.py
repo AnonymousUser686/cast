@@ -49,8 +49,8 @@ CROP = True        # crop to the 20x20 box the digits actually occupy
 IN_DIM = GRID * GRID
 HIDDEN = 20
 CLASSES = 10
-TILE = 5           # systolic array size
-BATCH_IMGS = 5     # images fed through the array together
+TILE = 5           # systolic array size, and images per array pass
+N_IMAGES = 100     # test images exported for the CaST program (multiple of TILE)
 EPOCHS = 8
 BATCH = 128
 SEED = 0
@@ -191,34 +191,41 @@ def main():
     print(f"  |acc1| max      {int(np.abs(acc1_all).max())} (int32 headroom ok)")
     print(f"  |acc2| max      {int(np.abs(logits_all).max())}")
 
-    # ---- reference batch: BATCH_IMGS images, one array-width of work ------
-    ref = list(range(BATCH_IMGS))
+    # ---- reference set: N_IMAGES images, NB array-widths of work ---------
+    ref = list(range(N_IMAGES))
     ref_x = xte_u8[ref]
     ref_acc1, ref_h, ref_logits = int_forward(ref_x, params)
+    ref_pred = ref_logits.argmax(1)
+    ref_labels = yte.numpy()[ref]
+    ref_correct = int((ref_pred == ref_labels).sum())
 
     kt1, jt1 = IN_DIM // TILE, HIDDEN // TILE
     kt2, jt2 = HIDDEN // TILE, CLASSES // TILE
+    nb = N_IMAGES // TILE                        # image batches of TILE each
 
     # ---- one 5x5 tile of layer 1, for the standalone tile demo -----------
     # An image corner is all background, so pick the pixel block carrying the
-    # most signal -- an all-zero tile would prove nothing.
-    kblock = int(ref_x.reshape(BATCH_IMGS, -1, TILE).sum(axis=(0, 2)).argmax())
+    # most signal -- an all-zero tile would prove nothing. The tile demo uses
+    # just the first array-width of images.
+    tile_x = ref_x[:TILE]
+    kblock = int(tile_x.reshape(TILE, -1, TILE).sum(axis=(0, 2)).argmax())
     k0 = kblock * TILE
-    x_tile = ref_x[:, k0:k0 + TILE]
+    x_tile = tile_x[:, k0:k0 + TILE]
     w_tile = w1q[:TILE, k0:k0 + TILE].T          # (in, out)
 
     doc = {
         "arch": {"grid": GRID, "crop": CROP, "in_dim": IN_DIM,
                  "hidden": HIDDEN, "classes": CLASSES, "tile": TILE,
-                 "batch": BATCH_IMGS,
+                 "images": N_IMAGES, "nb": nb,
                  "kt1": kt1, "jt1": jt1, "kt2": kt2, "jt2": jt2},
         "shift": shift,
         "accuracy": {"float": float_acc, "int": int_acc},
         "params": params,
         "tiles": {
-            # xt[kt][image][pixel]
-            "x": [ref_x[:, kt * TILE:(kt + 1) * TILE].tolist()
-                  for kt in range(kt1)],
+            # xt[ib * kt1 + kt][image within batch][pixel]
+            "x": [ref_x[ib * TILE:(ib + 1) * TILE,
+                        kt * TILE:(kt + 1) * TILE].tolist()
+                  for ib in range(nb) for kt in range(kt1)],
             "w1": tile_operand(w1q.T, kt1, jt1),
             "b1": [b1q[jt * TILE:(jt + 1) * TILE].tolist()
                    for jt in range(jt1)],
@@ -227,11 +234,12 @@ def main():
                    for jt in range(jt2)],
         },
         "reference": {
-            "labels": yte.numpy()[ref].tolist(),
+            "labels": ref_labels.tolist(),
             "acc1": ref_acc1.tolist(),
             "hidden": ref_h.tolist(),
             "logits": ref_logits.tolist(),
-            "pred": ref_logits.argmax(1).tolist(),
+            "pred": ref_pred.tolist(),
+            "correct": ref_correct,
         },
         "tile": {
             "feature_offset": k0,
@@ -242,8 +250,8 @@ def main():
     }
     OUT.write_text(json.dumps(doc, indent=1))
     print(f"wrote {OUT}")
-    print(f"\nreference batch labels {doc['reference']['labels']}"
-          f"  predictions {doc['reference']['pred']}")
+    print(f"\nreference set: {ref_correct} of {N_IMAGES} correct "
+          f"({ref_correct * 100.0 / N_IMAGES:.0f}%)")
 
 
 if __name__ == "__main__":

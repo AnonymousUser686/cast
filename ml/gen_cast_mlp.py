@@ -42,7 +42,8 @@ def constants(doc):
     T = doc["tiles"]
     a = doc["arch"]
     L = []
-    L.append("            // Pixels: xt[k-tile][image][pixel].")
+    L.append("            // Pixels: xt[batch * %d + k-tile][image in batch][pixel]."
+             % a["kt1"])
     for kt, blk in enumerate(T["x"]):
         L += rows("xt", kt, blk)
     L.append("")
@@ -66,15 +67,28 @@ def constants(doc):
         L.append("            " + " ".join(
             f"b2t[{jt}][{c}] = {u32(v)};" for c, v in enumerate(b)))
     L.append("")
-    L.append("            // True labels, printed alongside each guess.")
-    L.append("            " + " ".join(
-        f"lbl[{i}] = {v};" for i, v in enumerate(doc["reference"]["labels"])))
+    L.append("            // True labels, printed alongside each guess and")
+    L.append("            // compared against it to keep the running score.")
+    labels = doc["reference"]["labels"]
+    for i in range(0, len(labels), 10):
+        L.append("            " + " ".join(
+            f"lbl[{i + o}] = {v};" for o, v in enumerate(labels[i:i + 10])))
     return "\n".join(L)
 
 
 def gen(doc):
     a, sh = doc["arch"], doc["shift"]
     kt1, jt1, kt2, jt2 = a["kt1"], a["jt1"], a["kt2"], a["jt2"]
+    nimg, nb = a["images"], a["nb"]
+
+    # With exactly 100 images the count of correct guesses is already the
+    # percentage, which saves synthesising a divider for the summary line.
+    if nimg == 100:
+        pct = ("            // 100 images, so the score is already a percentage --\n"
+               "            // no divider needed.\n"
+               '            print("accuracy: ", ncorrect, "%");')
+    else:
+        pct = f'            print("accuracy: ", (ncorrect * 100) / {nimg}, "%");'
 
     src = f"""\
 // MNIST inference on a hexagonal systolic array.
@@ -85,8 +99,11 @@ def gen(doc):
 //   {a['grid']}x{a['grid']} pixels ({a['in_dim']}) -> {a['hidden']} hidden (ReLU) -> {a['classes']} classes
 //   {doc['accuracy']['int'] * 100:.2f}% integer test accuracy ({doc['accuracy']['float'] * 100:.2f}% in float)
 //
-// Five images are classified at once, which is what makes the {N}x{N} array
-// worth having: each pass computes a {N}x{N} block of (images x units).
+// {nimg} test images are classified, {N} at a time -- {N} images is exactly the
+// array's width, so each pass computes a {N}x{N} block of (images x units).
+// The {nb} batches run one after another through the same array; only the
+// pixels and labels are stored per image, the accumulators are reused.
+// A running score is kept and reported at the end.
 //
 // Arithmetic. Everything is a uint32 register holding a two's complement
 // int32. Multiply and add are sign-agnostic in two's complement, so the
@@ -94,18 +111,18 @@ def gen(doc):
 // places that DO care about sign are called out where they appear:
 // the ReLU sign test, the requantising shift, and the argmax compare.
 //
-// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration=8000
+// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration=100000
 
 machine MnistMLP {{
     interface {{}}
     shared {{
         // ---- model constants, written once in `setup` -------------------
-        var uint32 xt[{kt1}][{N}][{N}];
+        var uint32 xt[{nb * kt1}][{N}][{N}];
         var uint32 w1t[{kt1 * jt1}][{N}][{N}];
         var uint32 b1t[{jt1}][{N}];
         var uint32 w2t[{kt2 * jt2}][{N}][{N}];
         var uint32 b2t[{jt2}][{N}];
-        var uint32 lbl[{N}];
+        var uint32 lbl[{nimg}];
 
         // ---- the hexagonal array ----------------------------------------
         var uint32 ha[{SPAN}][{SPAN}];   // A operands in flight
@@ -123,18 +140,35 @@ machine MnistMLP {{
         var uint32 kt;
         var uint32 jt;
         var uint32 layer;
+        var uint32 ib;                   // which batch of {N} images
+        var uint32 ncorrect;             // running score
         var uint32 best[{N}];
         var uint32 pred[{N}];
-        var uint32 pp;
-        var uint32 pc;
         var uint32 pi;
     }}
     states {{
         setup: {{
 {constants(doc)}
 
-            layer = 1; kt = 0; jt = 0;
-            print("MnistMLP: {N} images, {a['in_dim']} pixels -> {a['hidden']} hidden -> {a['classes']} classes");
+            ib = 0; ncorrect = 0;
+            print("MnistMLP: {nimg} images, {a['in_dim']} pixels -> {a['hidden']} hidden -> {a['classes']} classes");
+            goto batch;
+        }}
+
+        // Start a batch of {N} images. The array and the weights are shared
+        // across all {nb} batches; only the accumulators need clearing.
+        batch: {{
+            for (var int p = 0; p < {jt1}; p++) {{
+                for (var int i = 0; i < {N}; i++) {{
+                    for (var int j = 0; j < {N}; j++) {{ acc1[p][i][j] = 0; }}
+                }}
+            }}
+            for (var int p = 0; p < {jt2}; p++) {{
+                for (var int i = 0; i < {N}; i++) {{
+                    for (var int c = 0; c < {N}; c++) {{ acc2[p][i][c] = 0; }}
+                }}
+            }}
+            layer = 1; kt = 0; jt = 0; pi = 0;
             goto stage;
         }}
 
@@ -145,7 +179,7 @@ machine MnistMLP {{
             if (layer == 1) {{
                 for (var int i = 0; i < {N}; i++) {{
                     for (var int k = 0; k < {N}; k++) {{
-                        opA[i][k] = xt[kt][i][k];
+                        opA[i][k] = xt[ib * {kt1} + kt][i][k];
                     }}
                 }}
                 for (var int k = 0; k < {N}; k++) {{
@@ -176,7 +210,7 @@ machine MnistMLP {{
             }}
             // Overrides the zero written just above: later writes win.
             if (layer == 1) {{
-                ha[{N - 1}][{N - 1}] = xt[kt][0][0];
+                ha[{N - 1}][{N - 1}] = xt[ib * {kt1} + kt][0][0];
                 hb[{N - 1}][{N - 1}] = w1t[kt * {jt1} + jt][0][0];
             }} else {{
                 ha[{N - 1}][{N - 1}] = acc1[kt][0][0];
@@ -367,28 +401,43 @@ machine MnistMLP {{
                     }}
                 }}
             }}
-            pp = 0; pc = 0; pi = 0;
-            goto show_hidden;
+            goto report;
         }}
 
-        // Reporting walks the results one per cycle with a runtime `goto`
-        // loop -- prints issued in the same state share a clock edge and
-        // Verilog leaves their order undefined.
-        show_hidden: {{
-            print("h[", pp * {N} + pc, "] = ", acc1[pp][0][pc]);
-            pc++;
-            if (pc < {N - 1}) {{
-                goto show_hidden;
+        // Score and report this batch, one image per cycle with a runtime
+        // `goto` loop -- prints issued in the same state share a clock edge
+        // and Verilog leaves their order undefined.
+        //
+        // The two prints below are in mutually exclusive branches, so only
+        // one fires per cycle.
+        report: {{
+            if (pred[pi] == lbl[ib * {N} + pi]) {{
+                ncorrect++;
+                print("image ", ib * {N} + pi, "  label ", lbl[ib * {N} + pi],
+                      "  guess ", pred[pi], "  ok");
             }} else {{
-                pc = 0; pp++;
-                if (pp < {jt1 - 1}) {{ goto show_hidden; }} else {{ goto show_pred; }}
+                print("image ", ib * {N} + pi, "  label ", lbl[ib * {N} + pi],
+                      "  guess ", pred[pi], "  WRONG");
+            }}
+            pi++;
+            // pi and ib read their start-of-cycle values, so both tests
+            // compare against the last index rather than the count.
+            if (pi < {N - 1}) {{
+                goto report;
+            }} else {{
+                ib++;
+                if (ib < {nb - 1}) {{ goto batch; }} else {{ goto summary; }}
             }}
         }}
 
-        show_pred: {{
-            print("image ", pi, "  label ", lbl[pi], "  guess ", pred[pi]);
-            pi++;
-            if (pi < {N - 1}) {{ goto show_pred; }} else {{ goto halt; }}
+        summary: {{
+            print("correct: ", ncorrect, " of {nimg}");
+            goto summary_pct;
+        }}
+
+        summary_pct: {{
+{pct}
+            goto halt;
         }}
 
         halt: {{ goto halt; }}
@@ -401,12 +450,17 @@ instantiate {{
 """
 
     ref = doc["reference"]
-    exp = [f"MnistMLP: {N} images, {a['in_dim']} pixels -> "
+    exp = [f"MnistMLP: {nimg} images, {a['in_dim']} pixels -> "
            f"{a['hidden']} hidden -> {a['classes']} classes"]
-    for k in range(a["hidden"]):
-        exp.append(f"h[{k}] = {ref['hidden'][0][k]}")
-    for i in range(N):
-        exp.append(f"image {i}  label {ref['labels'][i]}  guess {ref['pred'][i]}")
+    ncorrect = 0
+    for i in range(nimg):
+        lab, pre = ref["labels"][i], ref["pred"][i]
+        hit = "ok" if lab == pre else "WRONG"
+        ncorrect += lab == pre
+        exp.append(f"image {i}  label {lab}  guess {pre}  {hit}")
+    assert ncorrect == ref["correct"]
+    exp.append(f"correct: {ncorrect} of {nimg}")
+    exp.append(f"accuracy: {ncorrect * 100 // nimg}%")
     return src, "\n".join(exp) + "\n"
 
 

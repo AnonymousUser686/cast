@@ -1,26 +1,103 @@
-MnistMLP: 5 images, 25 pixels -> 20 hidden -> 10 classes
-h[0] = 0
-h[1] = 12
-h[2] = 28
-h[3] = 18
-h[4] = 63
-h[5] = 4
-h[6] = 25
-h[7] = 42
-h[8] = 55
-h[9] = 41
-h[10] = 11
-h[11] = 13
-h[12] = 0
-h[13] = 34
-h[14] = 37
-h[15] = 17
-h[16] = 18
-h[17] = 39
-h[18] = 0
-h[19] = 0
-image 0  label 7  guess 7
-image 1  label 2  guess 2
-image 2  label 1  guess 1
-image 3  label 0  guess 0
-image 4  label 4  guess 4
+MnistMLP: 100 images, 25 pixels -> 20 hidden -> 10 classes
+image 0  label 7  guess 7  ok
+image 1  label 2  guess 2  ok
+image 2  label 1  guess 1  ok
+image 3  label 0  guess 0  ok
+image 4  label 4  guess 4  ok
+image 5  label 1  guess 1  ok
+image 6  label 4  guess 4  ok
+image 7  label 9  guess 9  ok
+image 8  label 5  guess 6  WRONG
+image 9  label 9  guess 9  ok
+image 10  label 0  guess 0  ok
+image 11  label 6  guess 6  ok
+image 12  label 9  guess 9  ok
+image 13  label 0  guess 0  ok
+image 14  label 1  guess 1  ok
+image 15  label 5  guess 5  ok
+image 16  label 9  guess 9  ok
+image 17  label 7  guess 7  ok
+image 18  label 3  guess 3  ok
+image 19  label 4  guess 4  ok
+image 20  label 9  guess 9  ok
+image 21  label 6  guess 6  ok
+image 22  label 6  guess 6  ok
+image 23  label 5  guess 5  ok
+image 24  label 4  guess 4  ok
+image 25  label 0  guess 0  ok
+image 26  label 7  guess 7  ok
+image 27  label 4  guess 4  ok
+image 28  label 0  guess 0  ok
+image 29  label 1  guess 1  ok
+image 30  label 3  guess 3  ok
+image 31  label 1  guess 1  ok
+image 32  label 3  guess 3  ok
+image 33  label 4  guess 6  WRONG
+image 34  label 7  guess 7  ok
+image 35  label 2  guess 2  ok
+image 36  label 7  guess 7  ok
+image 37  label 1  guess 1  ok
+image 38  label 2  guess 2  ok
+image 39  label 1  guess 1  ok
+image 40  label 1  guess 1  ok
+image 41  label 7  guess 7  ok
+image 42  label 4  guess 4  ok
+image 43  label 2  guess 2  ok
+image 44  label 3  guess 3  ok
+image 45  label 5  guess 5  ok
+image 46  label 1  guess 3  WRONG
+image 47  label 2  guess 2  ok
+image 48  label 4  guess 4  ok
+image 49  label 4  guess 4  ok
+image 50  label 6  guess 6  ok
+image 51  label 3  guess 3  ok
+image 52  label 5  guess 5  ok
+image 53  label 5  guess 5  ok
+image 54  label 6  guess 6  ok
+image 55  label 0  guess 0  ok
+image 56  label 4  guess 4  ok
+image 57  label 1  guess 1  ok
+image 58  label 9  guess 9  ok
+image 59  label 5  guess 5  ok
+image 60  label 7  guess 7  ok
+image 61  label 8  guess 8  ok
+image 62  label 9  guess 4  WRONG
+image 63  label 3  guess 3  ok
+image 64  label 7  guess 7  ok
+image 65  label 4  guess 9  WRONG
+image 66  label 6  guess 6  ok
+image 67  label 4  guess 4  ok
+image 68  label 3  guess 3  ok
+image 69  label 0  guess 0  ok
+image 70  label 7  guess 7  ok
+image 71  label 0  guess 0  ok
+image 72  label 2  guess 2  ok
+image 73  label 9  guess 7  WRONG
+image 74  label 1  guess 1  ok
+image 75  label 7  guess 7  ok
+image 76  label 3  guess 3  ok
+image 77  label 2  guess 7  WRONG
+image 78  label 9  guess 9  ok
+image 79  label 7  guess 7  ok
+image 80  label 7  guess 7  ok
+image 81  label 6  guess 6  ok
+image 82  label 2  guess 2  ok
+image 83  label 7  guess 7  ok
+image 84  label 8  guess 5  WRONG
+image 85  label 4  guess 4  ok
+image 86  label 7  guess 7  ok
+image 87  label 3  guess 3  ok
+image 88  label 6  guess 6  ok
+image 89  label 1  guess 1  ok
+image 90  label 3  guess 3  ok
+image 91  label 6  guess 6  ok
+image 92  label 9  guess 9  ok
+image 93  label 3  guess 3  ok
+image 94  label 1  guess 1  ok
+image 95  label 4  guess 4  ok
+image 96  label 1  guess 1  ok
+image 97  label 7  guess 7  ok
+image 98  label 6  guess 6  ok
+image 99  label 9  guess 9  ok
+correct: 92 of 100
+accuracy: 92%
