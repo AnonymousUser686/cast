@@ -81,6 +81,16 @@ def gen(doc):
     kt1, jt1, kt2, jt2 = a["kt1"], a["jt1"], a["kt2"], a["jt2"]
     nimg, nb = a["images"], a["nb"]
 
+    # Exact run length, so the documented --duration never goes stale.
+    #   pass  = stage + steps + accum, where `step` runs for t = 0..LAST_T
+    #           inclusive, so LAST_T + 1 cycles
+    #   batch = clear + layer 1 passes + epilogue1 + layer 2 passes
+    #           + epilogue2 + argmax + N report cycles
+    per_pass = LAST_T + 3
+    per_batch = 4 + N + per_pass * (kt1 * jt1 + kt2 * jt2)
+    cycles = 1 + nb * per_batch + 2
+    duration = -(-cycles * 10 // 100000) * 100000     # round up to 100k ns
+
     # With exactly 100 images the count of correct guesses is already the
     # percentage, which saves synthesising a divider for the summary line.
     if nimg == 100:
@@ -111,7 +121,9 @@ def gen(doc):
 // places that DO care about sign are called out where they appear:
 // the ReLU sign test, the requantising shift, and the argmax compare.
 //
-// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration=100000
+// The run is {cycles} cycles ({cycles * 10} ns).
+//
+// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration={duration}
 
 machine MnistMLP {{
     interface {{}}
@@ -470,7 +482,7 @@ def main():
     CAST_OUT.write_text(src)
     EXP_OUT.write_text(expected)
     print(f"wrote {CAST_OUT}  ({len(src.splitlines())} lines)")
-    print(f"wrote {EXP_OUT}")
+    print(f"wrote {EXP_OUT}  ({len(expected.splitlines())} lines)")
 
 
 if __name__ == "__main__":

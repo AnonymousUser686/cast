@@ -18,26 +18,45 @@ for line.
 Every dimension is a multiple of 5, the array's tile size.
 
 ```
-28x28 -> crop to the 20x20 digit box -> pool to 5x5 = 25 pixels
-      -> 20 hidden (ReLU) -> 10 classes
+28x28 -> crop to the 20x20 digit box -> pool to 10x10 = 100 pixels
+      -> 40 hidden (ReLU) -> 10 classes
 ```
 
 | | |
 |---|---|
-| float test accuracy | 89.87% |
-| **integer test accuracy** | **89.78%** |
+| float test accuracy | 96.01% |
+| **integer test accuracy** | **95.97%** |
 | pixels | `uint8`, 0..255 |
 | weights | `int8`, symmetric per tensor |
-| accumulator | `int32` (peak 82664 — ample headroom) |
-| hidden requantise | `>> 9`, clamp to 255 |
-| weight registers | 700 |
+| accumulator | `int32` (peak 237831 — ample headroom) |
+| hidden requantise | `>> 10`, clamp to 255 |
+| weight registers | 4400 |
 | images classified | 100, in 20 batches of 5 |
-| array passes | 28 per batch (20 for layer 1, 8 for layer 2); 560 total |
-| run length | 8583 cycles |
+| array passes | 176 per batch (160 for layer 1, 16 for layer 2); 3520 total |
+| run length | 52983 cycles |
 
-Scaling up: `GRID = 10` in the training script reaches **94.6%**, at 2200
-weight registers and 88 passes. Raise it and regenerate if the larger design
-compiles comfortably on the node.
+## Scaling
+
+Measured on this pipeline, same quantisation throughout:
+
+| grid | inputs | hidden | int accuracy | weight registers | passes/batch |
+|---|---|---|---|---|---|
+| 5 | 25 | 20 | 88.8% | 700 | 28 |
+| **10** | **100** | **40** | **96.0%** | **4400** | **176** |
+| 15 | 225 | 60 | 97.4% | 14100 | 564 |
+| 20 | 400 | 100 | 97.8% | 41000 | 1640 |
+
+Weight registers are what bite first: every weight is a `seq.compreg`, so the
+generated Verilog grows with the model, and grid 20 is 41000 of them.
+
+**Roughly 97.8% is the ceiling for a two-layer MLP**, at any resolution — the
+last two rows buy 0.4 points for 3× the hardware. Reaching 99% on MNIST needs
+convolutions, which is a different dataflow: weight reuse across spatial
+positions rather than a single dense tile stream, so the array would have to
+be re-scheduled rather than just resized.
+
+Raise `GRID`/`HIDDEN` in the training script and rerun both generators to move
+along the table.
 
 ## The hexagonal array
 
@@ -100,35 +119,37 @@ The array is 5 wide in the image dimension, so **5 images go through
 together** — one pass computes a 5×5 block of (images × units). 100 images is
 20 such batches, run back to back through the same hardware.
 
-Only the pixels (2500 registers) and labels are stored per image. The
+Only the pixels (10000 registers) and labels are stored per image. The
 accumulators are cleared and reused each batch, and the score is a single
 running counter rather than 100 stored predictions.
 
 ## Running
 
 ```bash
-./simulate.sh examples/mnist_mlp_hex.cast --duration=100000
+./simulate.sh examples/mnist_mlp_hex.cast --duration=600000
 ```
 
 Expected — one line per image, then the score:
 
 ```
-MnistMLP: 100 images, 25 pixels -> 20 hidden -> 10 classes
+MnistMLP: 100 images, 100 pixels -> 40 hidden -> 10 classes
 image 0  label 7  guess 7  ok
 image 1  label 2  guess 2  ok
 ...
 image 99  label 9  guess 9  ok
-correct: 92 of 100
-accuracy: 92%
+correct: 98 of 100
+accuracy: 98%
 ```
 
-92 of these particular 100 images is consistent with 89.78% over the full
-10,000-image test set. Since the run is exactly 100 images, the count *is* the
-percentage — no divider is synthesised.
+**98 of these particular 100 images is a lucky draw, not the model's
+accuracy** — the honest number is 95.97% over the full 10,000-image test set.
+A 100-image sample has a standard error of about 2 points, so quote 96%.
+Since the run is exactly 100 images the count *is* the percentage, which
+saves synthesising a divider.
 
 Diff it against `tests/expected/mnist_mlp_hex.expected`; all 103 lines,
-including which 8 images are wrong, come from PyTorch. The run is 8583
-cycles (85830 ns), so `--duration=100000` leaves room.
+including which 2 images are wrong, come from PyTorch. The run is 52983
+cycles (529830 ns), so `--duration=600000` leaves room.
 
 `examples/mnist_tile.cast` is the smaller companion: one 5×5 layer-1 tile on
 the *square* array, printed in sign-magnitude. Useful to confirm signed
@@ -137,7 +158,7 @@ multiply on its own before running the whole network.
 Without a node, both check out under the behavioural simulator:
 
 ```bash
-tools/cast_sim --max-cycles=12000 examples/mnist_mlp_hex.cast
+tools/cast_sim --max-cycles=60000 examples/mnist_mlp_hex.cast   # ~45 s
 tools/cast_sim examples/mnist_tile.cast
 ```
 

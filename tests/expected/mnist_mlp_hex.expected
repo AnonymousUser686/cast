@@ -1,4 +1,4 @@
-MnistMLP: 100 images, 25 pixels -> 20 hidden -> 10 classes
+MnistMLP: 100 images, 100 pixels -> 40 hidden -> 10 classes
 image 0  label 7  guess 7  ok
 image 1  label 2  guess 2  ok
 image 2  label 1  guess 1  ok
@@ -45,7 +45,7 @@ image 42  label 4  guess 4  ok
 image 43  label 2  guess 2  ok
 image 44  label 3  guess 3  ok
 image 45  label 5  guess 5  ok
-image 46  label 1  guess 3  WRONG
+image 46  label 1  guess 1  ok
 image 47  label 2  guess 2  ok
 image 48  label 4  guess 4  ok
 image 49  label 4  guess 4  ok
@@ -61,10 +61,10 @@ image 58  label 9  guess 9  ok
 image 59  label 5  guess 5  ok
 image 60  label 7  guess 7  ok
 image 61  label 8  guess 8  ok
-image 62  label 9  guess 4  WRONG
+image 62  label 9  guess 9  ok
 image 63  label 3  guess 3  ok
 image 64  label 7  guess 7  ok
-image 65  label 4  guess 9  WRONG
+image 65  label 4  guess 4  ok
 image 66  label 6  guess 6  ok
 image 67  label 4  guess 4  ok
 image 68  label 3  guess 3  ok
@@ -72,18 +72,18 @@ image 69  label 0  guess 0  ok
 image 70  label 7  guess 7  ok
 image 71  label 0  guess 0  ok
 image 72  label 2  guess 2  ok
-image 73  label 9  guess 7  WRONG
+image 73  label 9  guess 9  ok
 image 74  label 1  guess 1  ok
 image 75  label 7  guess 7  ok
 image 76  label 3  guess 3  ok
-image 77  label 2  guess 7  WRONG
+image 77  label 2  guess 2  ok
 image 78  label 9  guess 9  ok
 image 79  label 7  guess 7  ok
 image 80  label 7  guess 7  ok
 image 81  label 6  guess 6  ok
 image 82  label 2  guess 2  ok
 image 83  label 7  guess 7  ok
-image 84  label 8  guess 5  WRONG
+image 84  label 8  guess 8  ok
 image 85  label 4  guess 4  ok
 image 86  label 7  guess 7  ok
 image 87  label 3  guess 3  ok
@@ -99,5 +99,5 @@ image 96  label 1  guess 1  ok
 image 97  label 7  guess 7  ok
 image 98  label 6  guess 6  ok
 image 99  label 9  guess 9  ok
-correct: 92 of 100
-accuracy: 92%
+correct: 98 of 100
+accuracy: 98%

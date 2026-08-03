@@ -132,11 +132,14 @@ feature:
 | `./simulate.sh examples/systolic_matmul.cast` | 2-D arrays, nested loops, systolic dataflow | `[ 14 28 42 ]` / `[ 32 64 96 ]` / `[ 50 100 150 ]` |
 | `./simulate.sh examples/pipeline.cast` | machine-to-machine channels | `got 0, 2, 4, 6, 8` |
 | `./simulate.sh examples/systolic_matmul_5x5_scalar.cast` | 5×5 systolic array | rows `55 110 165 220 275` … `355 710 1065 1420 1775` |
-| `./simulate.sh examples/mnist_mlp_hex.cast --duration=100000` | hexagonal array, negative weights, runtime `goto` loops | 100 `image N  label L  guess G  ok` lines, then `accuracy: 92%` |
+| `./simulate.sh examples/mnist_mlp_hex.cast --duration=600000` | hexagonal array, negative weights, runtime `goto` loops | 100 `image N  label L  guess G  ok` lines, then `accuracy: 98%` |
 
-The last one is the biggest program in the repo — a quantised MNIST network
-classifying 100 test images, whose output matches PyTorch exactly. It takes
-8583 cycles, so give it the long `--duration`. See [ml/README.md](ml/README.md).
+The last one is by far the biggest program in the repo — a quantised MNIST
+network (95.97% on the full test set) classifying 100 test images, whose
+output matches PyTorch exactly. It is 3271 lines of cast holding 4400 weights,
+and runs for 52983 cycles, so give it the long `--duration` and expect castc
+and iverilog to take noticeably longer than the other examples.
+See [ml/README.md](ml/README.md).
 
 Useful flags (passed through to `castc`):
 

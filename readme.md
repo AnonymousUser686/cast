@@ -486,7 +486,7 @@ producer → doubler → printer chain.
 | [systolic_matmul.cast](examples/systolic_matmul.cast) | Advanced | 3x3 output-stationary systolic array: 9 parallel MAC PEs with skewed operand injection |
 | [signed_arithmetic.cast](examples/signed_arithmetic.cast) | Intermediate | What works and what does not on negative values, and the sign-bit idioms that work around it |
 | [mnist_tile.cast](examples/mnist_tile.cast) | Advanced | One 5x5 tile of a quantised MNIST layer, with signed weights, printed in sign-magnitude |
-| [mnist_mlp_hex.cast](examples/mnist_mlp_hex.cast) | Advanced | MNIST inference on a hexagonal systolic array: 100 test images, 92% correct — see [ml/README.md](ml/README.md) |
+| [mnist_mlp_hex.cast](examples/mnist_mlp_hex.cast) | Advanced | MNIST inference on a hexagonal systolic array: 95.97% quantised MLP, scored over 100 test images — see [ml/README.md](ml/README.md) |
 
 Run any example:
 

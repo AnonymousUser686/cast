@@ -3,8 +3,8 @@
 The network is deliberately shaped so every dimension is a multiple of 5, the
 tile size of the systolic array:
 
-    28x28 -> crop to the 20x20 digit box -> pool to 5x5 = 25 pixels
-          -> 20 hidden (ReLU) -> 10 classes
+    28x28 -> crop to the 20x20 digit box -> pool to 10x10 = 100 pixels
+          -> 40 hidden (ReLU) -> 10 classes
 
 Everything is quantised to integers the CaST hardware can hold:
 
@@ -22,9 +22,18 @@ on CaST's unsigned wires:
     * right shift applied only AFTER ReLU, where the value cannot be negative
       (CaST's ``>>`` is logical, so it would be wrong on a negative)
 
-Scaling up: GRID=10 with HIDDEN=20 reaches 94.6%, at 2200 weight registers and
-88 array passes instead of 700 and 28. Raise GRID here and regenerate if the
-larger design compiles comfortably.
+Scaling. Measured integer accuracy against cost, same pipeline throughout:
+
+    grid  inputs  hidden   int acc   weight regs   passes/batch
+       5      25      20    88.8%            700             28
+      10     100      40    96.0%           4400            176
+      15     225      60    97.4%          14100            564
+      20     400     100    97.8%          41000           1640
+
+Roughly 97.8% is the ceiling for a two-layer MLP at any resolution; getting
+to 99% needs convolutions, which the array would have to be re-scheduled for.
+Raise GRID/HIDDEN here and regenerate if the larger design compiles
+comfortably -- weight registers are the cost that bites first.
 
 Run:  python ml/train_mnist_mlp.py
 Out:  ml/mnist_model.json
@@ -44,14 +53,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
 OUT = HERE / "mnist_model.json"
 
-GRID = 5           # pooled image is GRID x GRID
+GRID = 10          # pooled image is GRID x GRID
 CROP = True        # crop to the 20x20 box the digits actually occupy
 IN_DIM = GRID * GRID
-HIDDEN = 20
+HIDDEN = 40
 CLASSES = 10
 TILE = 5           # systolic array size, and images per array pass
 N_IMAGES = 100     # test images exported for the CaST program (multiple of TILE)
-EPOCHS = 8
+EPOCHS = 12
 BATCH = 128
 SEED = 0
 
@@ -90,6 +99,9 @@ def train(xtr, ytr, xte, yte):
     torch.manual_seed(SEED)
     net = MLP()
     opt = torch.optim.Adam(net.parameters(), lr=2e-3)
+    # Cosine decay is worth a few tenths of a point at this size and costs
+    # nothing at inference time.
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
     n = xtr.shape[0]
     for epoch in range(EPOCHS):
         perm = torch.randperm(n)
@@ -98,6 +110,7 @@ def train(xtr, ytr, xte, yte):
             opt.zero_grad()
             F.cross_entropy(net(xtr[idx]), ytr[idx]).backward()
             opt.step()
+        sched.step()
         with torch.no_grad():
             acc = (net(xte).argmax(1) == yte).float().mean().item()
         print(f"  epoch {epoch + 1}/{EPOCHS}  test acc {acc * 100:.2f}%")
