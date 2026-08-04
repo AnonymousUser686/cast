@@ -88,8 +88,18 @@ def gen(doc):
     #           + epilogue2 + argmax + N report cycles
     per_pass = LAST_T + 3
     per_batch = 4 + N + per_pass * (kt1 * jt1 + kt2 * jt2)
-    cycles = 1 + nb * per_batch + 2
+    # `cyc` in the program below counts exactly these: setup plus every batch.
+    # The five summary states do not tick it, so it reports the cost of the
+    # work rather than the cost of printing the report.
+    work = 1 + nb * per_batch
+    cycles = work + 5
     duration = -(-cycles * 10 // 100000) * 100000     # round up to 100k ns
+
+    # Useful multiply-accumulates. Every dimension is a multiple of the tile
+    # size, so no pass is padded and none of this is wasted work.
+    macs = nimg * (a["in_dim"] * a["hidden"] + a["hidden"] * a["classes"])
+    per_img = f"{work / nimg:.1f}"
+    density = f"{macs / work:.1f}"
 
     # With exactly 100 images the count of correct guesses is already the
     # percentage, which saves synthesising a divider for the summary line.
@@ -121,7 +131,11 @@ def gen(doc):
 // places that DO care about sign are called out where they appear:
 // the ReLU sign test, the requantising shift, and the argmax compare.
 //
-// The run is {cycles} cycles ({cycles * 10} ns).
+// Timing. A free-running counter reports the cycles the classification
+// actually took, so the figure is measured rather than asserted. It comes to
+// {work} cycles for {nimg} images ({per_img} each), during which the array
+// performs {macs} multiply-accumulates -- {density} per cycle. The whole
+// program including the printed summary is {cycles} cycles ({cycles * 10} ns).
 //
 // Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration={duration}
 
@@ -157,12 +171,21 @@ machine MnistMLP {{
         var uint32 best[{N}];
         var uint32 pred[{N}];
         var uint32 pi;
+
+        // ---- cycle counter ------------------------------------------------
+        // Ticks once in every state that does classification work, which is
+        // one tick per clock cycle. The summary states at the bottom leave it
+        // alone, so it stops at the cost of the work itself and does not
+        // count the cycles spent printing the report.
+        var uint32 cyc;
     }}
     states {{
         setup: {{
 {constants(doc)}
 
-            ib = 0; ncorrect = 0;
+            // `cyc` is set rather than incremented: this state IS cycle 1,
+            // and an explicit write does not depend on the reset value.
+            ib = 0; ncorrect = 0; cyc = 1;
             print("MnistMLP: {nimg} images, {a['in_dim']} pixels -> {a['hidden']} hidden -> {a['classes']} classes");
             goto batch;
         }}
@@ -180,7 +203,7 @@ machine MnistMLP {{
                     for (var int c = 0; c < {N}; c++) {{ acc2[p][i][c] = 0; }}
                 }}
             }}
-            layer = 1; kt = 0; jt = 0; pi = 0;
+            layer = 1; kt = 0; jt = 0; pi = 0; cyc++;
             goto stage;
         }}
 
@@ -228,7 +251,7 @@ machine MnistMLP {{
                 ha[{N - 1}][{N - 1}] = acc1[kt][0][0];
                 hb[{N - 1}][{N - 1}] = w2t[kt * {jt2} + jt][0][0];
             }}
-            t = 0;
+            t = 0; cyc++;
             goto step;
         }}
 
@@ -321,7 +344,7 @@ machine MnistMLP {{
                 }}
             }}
 
-            t++;
+            t++; cyc++;
             // t reads its start-of-cycle value, so the pass ends after the
             // cycle that captured C[{N - 1}][{N - 1}].
             if (t < {LAST_T}) {{ goto step; }} else {{ goto accum; }}
@@ -340,7 +363,7 @@ machine MnistMLP {{
                 }}
             }}
 
-            kt++;
+            kt++; cyc++;
             // kt and jt read their start-of-cycle values, so both tests
             // compare against the last index rather than the count.
             if (layer == 1) {{
@@ -380,7 +403,7 @@ machine MnistMLP {{
                     }}
                 }}
             }}
-            layer = 2; kt = 0; jt = 0;
+            layer = 2; kt = 0; jt = 0; cyc++;
             goto stage;
         }}
 
@@ -397,6 +420,7 @@ machine MnistMLP {{
                     }}
                 }}
             }}
+            cyc++;
             goto argmax;
         }}
 
@@ -413,6 +437,7 @@ machine MnistMLP {{
                     }}
                 }}
             }}
+            cyc++;
             goto report;
         }}
 
@@ -431,7 +456,7 @@ machine MnistMLP {{
                 print("image ", ib * {N} + pi, "  label ", lbl[ib * {N} + pi],
                       "  guess ", pred[pi], "  WRONG");
             }}
-            pi++;
+            pi++; cyc++;
             // pi and ib read their start-of-cycle values, so both tests
             // compare against the last index rather than the count.
             if (pi < {N - 1}) {{
@@ -449,6 +474,30 @@ machine MnistMLP {{
 
         summary_pct: {{
 {pct}
+            goto summary_cyc;
+        }}
+
+        // Timing, for comparison against other hardware. None of the summary
+        // states tick `cyc`, so it still holds the value it reached when the
+        // last image was scored -- the cost of the work, not of the report.
+        summary_cyc: {{
+            print("cycles: ", cyc);
+            goto summary_img;
+        }}
+
+        // Derived figures. These are compile-time constants rather than
+        // runtime arithmetic: a divider is a lot of hardware for a line of
+        // text, and the measured count above is what validates them.
+        summary_img: {{
+            print("cycles per image: {per_img}");
+            goto summary_mac;
+        }}
+
+        // {macs} = {nimg} images x ({a['in_dim']}x{a['hidden']} + {a['hidden']}x{a['classes']}) multiply-accumulates.
+        // Every dimension is a multiple of {N}, so no pass is padded and none
+        // of this is wasted work.
+        summary_mac: {{
+            print("MACs: {macs} ({density} per cycle)");
             goto halt;
         }}
 
@@ -473,6 +522,11 @@ instantiate {{
     assert ncorrect == ref["correct"]
     exp.append(f"correct: {ncorrect} of {nimg}")
     exp.append(f"accuracy: {ncorrect * 100 // nimg}%")
+    # The cycle count is measured by the program, so this line is a real
+    # prediction: if the schedule ever changes, the diff catches it here.
+    exp.append(f"cycles: {work}")
+    exp.append(f"cycles per image: {per_img}")
+    exp.append(f"MACs: {macs} ({density} per cycle)")
     return src, "\n".join(exp) + "\n"
 
 

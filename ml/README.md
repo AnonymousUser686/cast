@@ -17,6 +17,9 @@ image 8  label 5  guess 6  WRONG
 ...
 correct: 98 of 100
 accuracy: 98%
+cycles: 52981
+cycles per image: 529.8
+MACs: 440000 (8.3 per cycle)
 ```
 
 | | |
@@ -25,8 +28,8 @@ accuracy: 98%
 | score on the 100 images it runs | 98 / 100 |
 | network | 100 pixels → 40 hidden (ReLU) → 10 classes |
 | arithmetic | integer only — `uint8` pixels, `int8` weights, `int32` accumulators |
-| program | 3,271 lines of CaST, ~15,200 registers |
-| run length | 52,983 cycles |
+| program | 3,310 lines of CaST, ~15,200 registers |
+| classification | **52,981 cycles** for 100 images, 440,000 MACs at 8.3/cycle |
 
 > **Quote 95.97%, not 98%.** The program scores the first 100 test images and
 > happens to get 98 of them. A 100-image sample has a standard error of about
@@ -61,7 +64,7 @@ On a node with `castc` (see [../GETTING_STARTED.md](../GETTING_STARTED.md)):
 ./simulate.sh examples/mnist_mlp_hex.cast --duration=600000
 ```
 
-The long `--duration` is required — the run is 529,830 ns and the default is
+The long `--duration` is required — the run is 529,860 ns and the default is
 500 ns. This is the largest program in the repo, so **expect `castc` and
 especially `iverilog` to take noticeably longer than the other examples.**
 
@@ -76,7 +79,7 @@ tools/cast_sim examples/mnist_tile.cast                         # instant
 ```
 
 Either way, the output should match `tests/expected/mnist_mlp_hex.expected`
-line for line — all 103 lines of it.
+line for line — all 106 lines of it.
 
 ---
 
@@ -322,7 +325,7 @@ setup                                    once: write every constant
   │     ├─► argmax                          5 predictions              │
   │     └─► report                   ×5     print and score           ─┘
   │
-  └─► summary ─► halt                    final count and percentage
+  └─► summary… ─► halt                   score, then the timing figures
 ```
 
 | state | cycles | what it does |
@@ -336,15 +339,61 @@ setup                                    once: write every constant
 | `epilogue2` | 1 | bias, then offset the logits for the argmax compare |
 | `argmax` | 1 | picks the largest of 10 logits for each of 5 images |
 | `report` | 5 | one image printed per cycle, scoring as it goes |
-| `summary` | 2 | the final count and percentage |
+| `summary*` | 5 | score, percentage, and the three timing lines |
 
 `t = 0..12` inclusive is 13 cycles because `LAST_T = 3 × (5−1) = 12` is the
 largest value of `i + j + k`. So a pass is `1 + 13 + 1 = 15` cycles, a batch
-is `1 + 176×15 + 1 + 1 + 1 + 5 = 2,649`, and the whole run is
-`1 + 20×2,649 + 2 = 52,983` cycles.
+is `1 + 176×15 + 1 + 1 + 1 + 5 = 2,649`, and the classification is
+`1 + 20×2,649 = 52,981` cycles. The five summary states bring the whole
+program to 52,986.
 
-The generator computes that number rather than hardcoding it, so the
+The generator computes those numbers rather than hardcoding them, so the
 `--duration` in the header never goes stale when the model changes.
+
+### The cycle counter
+
+The `cycles:` line the program prints is **measured, not asserted**. A
+register `cyc` is incremented once in every state that does classification
+work — `setup`, `batch`, `stage`, `step`, `accum`, both epilogues, `argmax`
+and `report` — which is exactly once per clock cycle. The summary states
+deliberately leave it alone, so it stops at the cost of the work rather than
+counting the cycles spent printing the report.
+
+That makes the expected-output file a real prediction: `cycles: 52981` is
+computed by the generator from the schedule, and the program independently
+arrives at the same number by counting. If a future change to the state
+machine altered the schedule, the diff would catch it.
+
+The two derived lines below it — `cycles per image` and `MACs per cycle` — are
+compile-time constants rather than runtime arithmetic. A 32-bit divider is a
+lot of hardware for a line of text, and the measured count above them is what
+validates them.
+
+For comparing against other hardware, the useful shape of it is:
+
+| | |
+|---|---|
+| useful MACs | 440,000 = 100 images × (100×40 + 40×10) |
+| cycles | 52,981 |
+| **throughput** | **8.3 MACs/cycle**, 529.8 cycles/image |
+| multipliers instantiated | 81 (the full 9×9 grid) |
+| peak achievable | 19 MACs in one cycle, at `t = 6` |
+
+The gap between 8.3 and 81 is worth understanding before quoting it as an
+efficiency figure, because it comes from two different places:
+
+* **81 → ~20 is inherent to this array.** Twenty of the 81 sites are dead
+  corners, and as [§5](#5-the-hexagonal-array) explains, a live PE only holds
+  a matching `(i,j,k)` triple one cycle in three. So even perfectly fed, the
+  hexagon tops out near 61/3 ≈ 20 MACs/cycle.
+* **~20 → 8.3 is the simplification noted below.** The array is drained and
+  reloaded between passes rather than pipelined, so each pass pays a ramp-up
+  and ramp-down (125 MACs spread over 13 `step` cycles = 9.6/cycle), and the
+  `stage`/`accum` cycles around it add no MACs at all.
+
+The second gap is recoverable — streaming the next tile in behind the current
+one would roughly double throughput. The first is the price of the (1,1,1)
+projection that makes the array hexagonal in the first place.
 
 Two deliberate simplifications: the array is cleared and reloaded for every
 pass rather than pipelined across passes, and `report` prints one image per
@@ -409,7 +458,7 @@ model:
 | layer 2 weights | 400 |
 | biases, labels | 150 |
 | the hexagonal array (`ha`/`hb`/`hc`/`hr`, 4 × 81) | 324 |
-| accumulators, staging, counters | 342 |
+| accumulators, staging, counters (including `cyc`) | 343 |
 | **total** | **≈ 15,200** |
 
 Note that the *pixels dominate* — two thirds of the design is baked-in test
@@ -456,13 +505,19 @@ asserted:
    every prediction, including the wrong ones — into
    `tests/expected/mnist_mlp_hex.expected`, and asserts its own score matches
    the one recorded at training time.
-3. The CaST program's output is diffed against that file. All 103 lines match,
+3. The CaST program's output is diffed against that file. All 106 lines match,
    including `image 8  label 5  guess 6  WRONG` and
    `image 33  label 4  guess 6  WRONG`.
 
 Agreeing on which images are *wrong* is the strong part. A rounding error
 anywhere in 3,520 array passes would change a logit, and near-ties like those
 two are exactly where it would show.
+
+The `cycles: 52981` line is checked the same way, from the other direction:
+the generator predicts it from the schedule, the program counts it at runtime,
+and the diff compares the two. So the timing figure is verified rather than
+documented, and any change to the state machine that costs a cycle shows up
+immediately.
 
 If the diff ever fails, work up the chain: run `mnist_tile.cast` first (one
 tile, prints raw accumulator values) to isolate signed multiply from the

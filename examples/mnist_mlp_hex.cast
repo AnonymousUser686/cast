@@ -18,7 +18,11 @@
 // places that DO care about sign are called out where they appear:
 // the ReLU sign test, the requantising shift, and the argmax compare.
 //
-// The run is 52983 cycles (529830 ns).
+// Timing. A free-running counter reports the cycles the classification
+// actually took, so the figure is measured rather than asserted. It comes to
+// 52981 cycles for 100 images (529.8 each), during which the array
+// performs 440000 multiply-accumulates -- 8.3 per cycle. The whole
+// program including the printed summary is 52986 cycles (529860 ns).
 //
 // Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration=600000
 
@@ -54,6 +58,13 @@ machine MnistMLP {
         var uint32 best[5];
         var uint32 pred[5];
         var uint32 pi;
+
+        // ---- cycle counter ------------------------------------------------
+        // Ticks once in every state that does classification work, which is
+        // one tick per clock cycle. The summary states at the bottom leave it
+        // alone, so it stops at the cost of the work itself and does not
+        // count the cycles spent printing the report.
+        var uint32 cyc;
     }
     states {
         setup: {
@@ -2970,7 +2981,9 @@ machine MnistMLP {
             lbl[80] = 7; lbl[81] = 6; lbl[82] = 2; lbl[83] = 7; lbl[84] = 8; lbl[85] = 4; lbl[86] = 7; lbl[87] = 3; lbl[88] = 6; lbl[89] = 1;
             lbl[90] = 3; lbl[91] = 6; lbl[92] = 9; lbl[93] = 3; lbl[94] = 1; lbl[95] = 4; lbl[96] = 1; lbl[97] = 7; lbl[98] = 6; lbl[99] = 9;
 
-            ib = 0; ncorrect = 0;
+            // `cyc` is set rather than incremented: this state IS cycle 1,
+            // and an explicit write does not depend on the reset value.
+            ib = 0; ncorrect = 0; cyc = 1;
             print("MnistMLP: 100 images, 100 pixels -> 40 hidden -> 10 classes");
             goto batch;
         }
@@ -2988,7 +3001,7 @@ machine MnistMLP {
                     for (var int c = 0; c < 5; c++) { acc2[p][i][c] = 0; }
                 }
             }
-            layer = 1; kt = 0; jt = 0; pi = 0;
+            layer = 1; kt = 0; jt = 0; pi = 0; cyc++;
             goto stage;
         }
 
@@ -3036,7 +3049,7 @@ machine MnistMLP {
                 ha[4][4] = acc1[kt][0][0];
                 hb[4][4] = w2t[kt * 2 + jt][0][0];
             }
-            t = 0;
+            t = 0; cyc++;
             goto step;
         }
 
@@ -3129,7 +3142,7 @@ machine MnistMLP {
                 }
             }
 
-            t++;
+            t++; cyc++;
             // t reads its start-of-cycle value, so the pass ends after the
             // cycle that captured C[4][4].
             if (t < 12) { goto step; } else { goto accum; }
@@ -3148,7 +3161,7 @@ machine MnistMLP {
                 }
             }
 
-            kt++;
+            kt++; cyc++;
             // kt and jt read their start-of-cycle values, so both tests
             // compare against the last index rather than the count.
             if (layer == 1) {
@@ -3188,7 +3201,7 @@ machine MnistMLP {
                     }
                 }
             }
-            layer = 2; kt = 0; jt = 0;
+            layer = 2; kt = 0; jt = 0; cyc++;
             goto stage;
         }
 
@@ -3205,6 +3218,7 @@ machine MnistMLP {
                     }
                 }
             }
+            cyc++;
             goto argmax;
         }
 
@@ -3221,6 +3235,7 @@ machine MnistMLP {
                     }
                 }
             }
+            cyc++;
             goto report;
         }
 
@@ -3239,7 +3254,7 @@ machine MnistMLP {
                 print("image ", ib * 5 + pi, "  label ", lbl[ib * 5 + pi],
                       "  guess ", pred[pi], "  WRONG");
             }
-            pi++;
+            pi++; cyc++;
             // pi and ib read their start-of-cycle values, so both tests
             // compare against the last index rather than the count.
             if (pi < 4) {
@@ -3259,6 +3274,30 @@ machine MnistMLP {
             // 100 images, so the score is already a percentage --
             // no divider needed.
             print("accuracy: ", ncorrect, "%");
+            goto summary_cyc;
+        }
+
+        // Timing, for comparison against other hardware. None of the summary
+        // states tick `cyc`, so it still holds the value it reached when the
+        // last image was scored -- the cost of the work, not of the report.
+        summary_cyc: {
+            print("cycles: ", cyc);
+            goto summary_img;
+        }
+
+        // Derived figures. These are compile-time constants rather than
+        // runtime arithmetic: a divider is a lot of hardware for a line of
+        // text, and the measured count above is what validates them.
+        summary_img: {
+            print("cycles per image: 529.8");
+            goto summary_mac;
+        }
+
+        // 440000 = 100 images x (100x40 + 40x10) multiply-accumulates.
+        // Every dimension is a multiple of 5, so no pass is padded and none
+        // of this is wasted work.
+        summary_mac: {
+            print("MACs: 440000 (8.3 per cycle)");
             goto halt;
         }
 

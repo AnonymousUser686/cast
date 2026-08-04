@@ -101,3 +101,6 @@ image 98  label 6  guess 6  ok
 image 99  label 9  guess 9  ok
 correct: 98 of 100
 accuracy: 98%
+cycles: 52981
+cycles per image: 529.8
+MACs: 440000 (8.3 per cycle)
