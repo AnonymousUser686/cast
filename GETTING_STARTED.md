@@ -132,13 +132,14 @@ feature:
 | `./simulate.sh examples/systolic_matmul.cast` | 2-D arrays, nested loops, systolic dataflow | `[ 14 28 42 ]` / `[ 32 64 96 ]` / `[ 50 100 150 ]` |
 | `./simulate.sh examples/pipeline.cast` | machine-to-machine channels | `got 0, 2, 4, 6, 8` |
 | `./simulate.sh examples/systolic_matmul_5x5_scalar.cast` | 5×5 systolic array | rows `55 110 165 220 275` … `355 710 1065 1420 1775` |
-| `./simulate.sh examples/mnist_mlp_hex.cast --duration=600000` | hexagonal array, negative weights, runtime `goto` loops | 100 `image N  label L  guess G  ok` lines, then `accuracy: 98%` and `cycles: 52981` |
+| `./simulate.sh examples/mnist_mlp_hex.cast` | hexagonal array, negative weights, runtime `goto` loops | 100 `image N  label L  guess G  ok` lines, then `accuracy: 98%` and `cycles: 52981` |
 
 The last one is by far the biggest program in the repo — a quantised MNIST
 network (95.97% on the full test set) classifying 100 test images, whose
-output matches PyTorch exactly. It is 3310 lines of cast holding 4400 weights,
+output matches PyTorch exactly. It is 3317 lines of cast holding 4400 weights,
 and counts its own runtime with a cycle counter — 52981 cycles to classify all
-100 images. Give it the long `--duration` and expect castc
+100 images. It needs a 600000 ns simulation rather than the default 500, but
+it declares that itself (see below), so no extra flag is needed. Expect castc
 and iverilog to take noticeably longer than the other examples.
 See [ml/README.md](ml/README.md).
 
@@ -148,6 +149,15 @@ Useful flags (passed through to `castc`):
 ./simulate.sh myprog.cast --duration=2000      # simulate longer (ns, default 500)
 ./simulate.sh myprog.cast --vcd=/tmp/my.vcd    # waveform for gtkwave
 ```
+
+A program that always needs a particular flag can say so in a comment, which
+`simulate.sh` picks up — useful for anything that runs longer than 500 ns:
+
+```cast
+// simulate: --duration=600000
+```
+
+Flags passed on the command line override the ones declared in the file.
 
 Ignore the `$fwrite ... cannot be synthesized in an always_ff process`
 warnings from iverilog — `print` is simulation-only by design.
@@ -342,6 +352,7 @@ does not emit Verilog, and it will not reproduce quirks of an older prebuilt
 
 | Symptom | Cause / fix |
 |---|---|
+| `'array/slice indexing' is not yet supported`, or a burst of `extraneous input` parse errors on a file that used to work | You are on the node image's old castc — install the Actions build (step 2). `simulate.sh` now detects this case and prints the fix. Re-copy `examples/` too; the image's copies are stale |
 | `Permission denied` running castc | Missing `chmod +x` (zip drops the executable bit) |
 | `version 'GLIBC_2.38' not found` | Dynamically linked build; re-run the workflow and confirm the run's "Report binary portability" step says `link mode: static` |
 | `cannot execute binary file` | Wrong architecture — that artifact is Linux x86-64, it will not run on macOS |

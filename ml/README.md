@@ -28,7 +28,7 @@ MACs: 440000 (8.3 per cycle)
 | score on the 100 images it runs | 98 / 100 |
 | network | 100 pixels → 40 hidden (ReLU) → 10 classes |
 | arithmetic | integer only — `uint8` pixels, `int8` weights, `int32` accumulators |
-| program | 3,310 lines of CaST, ~15,200 registers |
+| program | 3,317 lines of CaST, ~15,200 registers |
 | classification | **52,981 cycles** for 100 images, 440,000 MACs at 8.3/cycle |
 
 > **Quote 95.97%, not 98%.** The program scores the first 100 test images and
@@ -61,12 +61,22 @@ MACs: 440000 (8.3 per cycle)
 On a node with `castc` (see [../GETTING_STARTED.md](../GETTING_STARTED.md)):
 
 ```bash
-./simulate.sh examples/mnist_mlp_hex.cast --duration=600000
+./simulate.sh examples/mnist_mlp_hex.cast
 ```
 
-The long `--duration` is required — the run is 529,860 ns and the default is
-500 ns. This is the largest program in the repo, so **expect `castc` and
-especially `iverilog` to take noticeably longer than the other examples.**
+The run is 529,860 ns against a 500 ns default, so it needs a long
+`--duration`. The program declares that itself with a `// simulate:` comment
+in its header, which `simulate.sh` picks up, so there is no flag to remember.
+Passing `--duration` explicitly still overrides it.
+
+This is the largest program in the repo, so **expect `castc` and especially
+`iverilog` to take noticeably longer than the other examples.**
+
+> If the compile dies with `'array/slice indexing' is not yet supported` or a
+> burst of `extraneous input` parse errors, you are on the old castc from the
+> node image rather than a current build — `simulate.sh` will say so and give
+> the fix. `omf load` wipes the disk, so this comes back after every re-image,
+> and the node's copy of `examples/` goes stale the same way.
 
 Without a node, the behavioural simulator needs only a C++ compiler:
 

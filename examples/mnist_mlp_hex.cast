@@ -24,7 +24,14 @@
 // performs 440000 multiply-accumulates -- 8.3 per cycle. The whole
 // program including the printed summary is 52986 cycles (529860 ns).
 //
-// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration=600000
+// The default 500 ns would stop this after 50 cycles, so the run needs a
+// long --duration. simulate.sh reads the line below and applies it, so
+//
+//     ./simulate.sh examples/mnist_mlp_hex.cast
+//
+// is enough; passing --duration explicitly still overrides it.
+//
+// simulate: --duration=600000
 
 machine MnistMLP {
     interface {}

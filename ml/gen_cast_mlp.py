@@ -137,7 +137,14 @@ def gen(doc):
 // performs {macs} multiply-accumulates -- {density} per cycle. The whole
 // program including the printed summary is {cycles} cycles ({cycles * 10} ns).
 //
-// Run with:  ./simulate.sh examples/mnist_mlp_hex.cast --duration={duration}
+// The default 500 ns would stop this after 50 cycles, so the run needs a
+// long --duration. simulate.sh reads the line below and applies it, so
+//
+//     ./simulate.sh examples/mnist_mlp_hex.cast
+//
+// is enough; passing --duration explicitly still overrides it.
+//
+// simulate: --duration={duration}
 
 machine MnistMLP {{
     interface {{}}
